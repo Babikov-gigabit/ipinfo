@@ -62,7 +62,12 @@ class ConfigTest(unittest.TestCase):
     def test_sample_has_no_servers(self):
         cfg = config.load(os.devnull + "-missing")
         self.assertEqual(cfg["vpn"], [])
-        self.assertTrue(cfg["rdp"])
+        self.assertFalse(cfg["rdp"])  # входящий RDP по умолчанию не проверяется
+        self.assertEqual(cfg["rdp_targets"], [])
+
+    def test_rdp_targets(self):
+        self.assertEqual(config._rdp_target("10.1.1.5"), {"host": "10.1.1.5", "port": 3389})
+        self.assertEqual(config._rdp_target("ts.corp:3390"), {"host": "ts.corp", "port": 3390})
 
 
 class ParseTest(unittest.TestCase):
@@ -233,13 +238,50 @@ class DiagnoseTest(unittest.TestCase):
         d = self.run_diag([self.lan, self.vpn], devices=[])
         self.assertFalse(any(c["name"].startswith("Адаптер") for c in d["checks"]))
 
-    def test_other_vpn_warning(self):
+    def test_other_vpn_is_not_an_error_when_all_works(self):
         happ = adapter("happ-tun", ["172.19.0.1/30"], iftype=53, index=12,
                        desc="sing-tun Tunnel")
         d = self.run_diag([self.lan, happ, self.vpn])
         self.assertEqual(d["other_vpn"], ["happ-tun"])
-        self.assertIn("посторонний VPN (happ-tun)", " ".join(d["verdict"]))
         self.assertEqual(d["tunnels"], ["Continent 4"])
+        self.assertNotIn("другой VPN", " ".join(d["verdict"]))
+        self.assertTrue(any(c["name"] == "Другой VPN" and c["status"] == "info"
+                            for c in d["checks"]))
+
+    def test_vpn_server_routed_through_other_vpn(self):
+        happ = adapter("happ-tun", ["172.19.0.1/30"], iftype=53, index=12,
+                       desc="sing-tun Tunnel")
+        d = self.run_diag([self.lan, happ, self.vpn], best={"5.5.5.5": 12, "1.1.1.1": 12})
+        v = " ".join(d["verdict"])
+        self.assertIn("идёт через другой VPN (main через «happ-tun»)", v)
+        inet = next(c for c in d["checks"] if c["name"] == "1.1.1.1")
+        self.assertIn("через «happ-tun»", inet["summary"])
+
+    def test_virtual_adapter_without_gateway_is_info(self):
+        vbox = adapter("Ethernet 3", ["192.168.56.1/24"], index=4,
+                       desc="VirtualBox Host-Only Ethernet Adapter")
+        d = self.run_diag([self.lan, vbox, self.vpn])
+        c = next(c for c in d["checks"] if c["name"].startswith("Ethernet 3"))
+        self.assertEqual(c["status"], "info")
+
+    def test_internal_defaults_to_tunnel_dns(self):
+        self.cfg["internal"] = []
+        vpn = dict(self.vpn, dns=["10.61.30.91", "78.88.8.8"])
+        d = self.run_diag([self.lan, vpn])
+        names = [c["name"] for c in d["checks"] if c["group"] == "Туннель"]
+        self.assertIn("DNS туннеля (10.61.30.91)", names)
+        self.assertNotIn("DNS туннеля (78.88.8.8)", names)
+
+    def test_rdp_outbound_targets(self):
+        self.cfg["rdp_targets"] = [{"host": "10.0.0.5", "port": 3389},
+                                   {"host": "10.0.0.6", "port": 3389}]
+        with mock.patch.object(diagnose, "_probe_rdp", side_effect=lambda h, p: {
+                "host": h, "ip": h, "port": p, "tcp_ok": h == "10.0.0.5",
+                "tcp": 15.0 if h == "10.0.0.5" else "нет ответа за 5 с"}):
+            d = self.run_diag([self.lan, self.vpn])
+        v = " ".join(d["verdict"])
+        self.assertIn("RDP-серверы недоступны: 10.0.0.6:3389", v)
+        self.assertIn("Туннель при этом работает", v)
 
     def test_report_text_and_zip(self):
         d = self.run_diag([self.lan, self.vpn])

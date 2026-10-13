@@ -40,10 +40,12 @@ openconnect = OpenConnect, Wintun, TAP-Windows
 other = sing-tun, happ, WireGuard, AmneziaWG, Amnezia, Clash, v2ray, Xray, Hiddify, Nekoray, Outline, Proton, NordLynx, Radmin, Hamachi, ZeroTier, Tailscale, OpenVPN
 
 [rdp]
-; Проверять ли готовность ПК принимать входящие RDP-подключения через туннель.
-enabled = yes
-; Сети, из которых администраторы подключаются по RDP (через запятую).
-; Проверяется, что ответы ПК в эти сети уйдут в туннель, а не в домашнюю сеть.
+; RDP-серверы, к которым пользователь подключается с этого ПК через туннель.
+; Адрес или адрес:порт, через запятую. Проверяется, открыт ли порт.
+; targets = 10.61.10.5, ts.corp.local:3389
+; Проверять ли ещё и входящий RDP на этот ПК (обычно не нужно).
+incoming = no
+; Для входящего RDP: сети администраторов, ответы в которые должны идти в туннель.
 ; sources = 10.1.2.0/24
 
 [logs]
@@ -81,6 +83,14 @@ def parse_endpoint(value):
     if m:
         v, port = m.group(1), int(m.group(2))
     return v.strip(), port, proto
+
+
+def _rdp_target(value):
+    """'host' или 'host:port' -> {'host', 'port'}; порт по умолчанию 3389."""
+    m = re.match(r"^\[?([^\]]+?)\]?:(\d+)$", value.strip())
+    if m:
+        return {"host": m.group(1), "port": int(m.group(2))}
+    return {"host": value.strip(), "port": 3389}
 
 
 def ensure_config():
@@ -129,7 +139,8 @@ def load(path=None):
             "OpenConnect": _split(cp.get("tunnel", "openconnect", fallback="")),
         },
         "other_vpn": _split(cp.get("tunnel", "other", fallback="")),
-        "rdp": cp.getboolean("rdp", "enabled", fallback=True),
+        "rdp": cp.getboolean("rdp", "incoming", fallback=False),
+        "rdp_targets": [_rdp_target(t) for t in _split(cp.get("rdp", "targets", fallback=""))],
         "rdp_sources": _split(cp.get("rdp", "sources", fallback="")),
         "logs": {n: os.path.expandvars(v.strip()) for n, v in cp.items("logs") if v.strip()},
     }

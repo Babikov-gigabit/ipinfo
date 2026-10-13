@@ -89,6 +89,23 @@ def classify(adapter_list, cfg):
     return tunnels, local, idle_vpn, lan_conflicts
 
 
+VIRTUAL_WORDS = ("VirtualBox", "VMware", "Hyper-V", "vEthernet", "Host-Only")
+
+
+def _is_virtual(adapter):
+    """Адаптеры виртуальных машин: на связь с интернетом и VPN не влияют."""
+    text = "%s %s" % (adapter.get("name", ""), adapter.get("description", ""))
+    return any(w.lower() in text.lower() for w in VIRTUAL_WORDS)
+
+
+def _probe_rdp(host, port):
+    ip, err = probes.resolve4(host)
+    if ip is None:
+        return {"host": host, "ip": None, "dns_error": err}
+    ok, info = probes.tcp_connect(ip, port, timeout=5)
+    return {"host": host, "ip": ip, "port": port, "tcp_ok": ok, "tcp": info}
+
+
 def _in(ip, net):
     try:
         return ipaddress.IPv4Address(ip) in net
@@ -142,6 +159,13 @@ def run(cfg, progress=None):
     all_adapters = ad.get_adapters(include_down=True)
     tunnels, local, idle_vpn, lan_conflicts = classify(all_adapters, cfg)
     by_index = {a["index"]: a for a in all_adapters if a.get("index")}
+    other_vpn = _other_vpn(all_adapters, cfg)
+    other_index = {a["index"] for a in other_vpn}
+
+    def via_other(ip):
+        """Адаптер постороннего VPN, через который уйдёт пакет на ip, или None."""
+        idx = ad.best_interface(ip) if other_index and ip else None
+        return by_index.get(idx) if idx in other_index else None
 
     # Трафик туннеля до проверок: потом сравним, вернулось ли что-то
     stats_before = {t["index"]: ad.if_stats(t["index"]) for t in tunnels}
@@ -152,8 +176,10 @@ def run(cfg, progress=None):
     f_inet = {h: pool.submit(_probe_host, h) for h in cfg["internet"]}
     f_ext = pool.submit(probes.external_ip)
     f_vpn = {s["name"]: pool.submit(_probe_vpn_server, s) for s in cfg["vpn"]}
+    internal = cfg["internal"] or _auto_internal(tunnels, cfg)
     f_int = {i["name"]: pool.submit(_probe_host, i["host"], 6, bool(tunnels))
-             for i in cfg["internal"]}
+             for i in internal}
+    f_rdpt = [pool.submit(_probe_rdp, t["host"], t["port"]) for t in cfg.get("rdp_targets", [])]
     f_wifi = pool.submit(winsys.wifi_info)
     f_rdp = pool.submit(winsys.rdp_info) if cfg["rdp"] else None
     f_fw = pool.submit(winsys.firewall_info) if cfg["rdp"] else None
@@ -173,6 +199,9 @@ def run(cfg, progress=None):
         if all(ad.is_apipa(ip) for ip in ips):
             rep.add(G, name, FAIL, "адрес %s: DHCP не выдал адрес (роутер не ответил)" % ips[0],
                     adapter=a)
+        elif not a["gateway"] and _is_virtual(a):
+            rep.add(G, name, INFO, "%s, виртуальный адаптер (%s): на связь не влияет"
+                    % (ips[0], a["description"]), adapter=a)
         elif not a["gateway"]:
             rep.add(G, name, WARN, "%s, нет шлюза: выхода в другие сети не будет" % ips[0],
                     adapter=a)
@@ -180,11 +209,9 @@ def run(cfg, progress=None):
             rep.add(G, name, OK, "%s, шлюз %s, DNS %s" % (
                 ", ".join(a["ipv4"]), ", ".join(a["gateway"]), ", ".join(a["dns"]) or "-"),
                 adapter=a)
-    other_vpn = _other_vpn(all_adapters, cfg)
     for a in other_vpn:
-        rep.add(G, "Посторонний VPN", WARN,
-                "включён «%s» (%s): он может перехватывать трафик и мешать корпоративному "
-                "туннелю и RDP" % (a["name"], a["description"]), adapter=a["name"])
+        rep.add(G, "Другой VPN", INFO, "включён «%s» (%s)" % (a["name"], a["description"]),
+                adapter=a["name"])
     for a in lan_conflicts:
         rep.add(G, "Конфликт адресов", WARN,
                 "сеть «%s» использует %s: тот же диапазон, что у корпоративной сети. "
@@ -217,6 +244,9 @@ def run(cfg, progress=None):
         p = r["ping"]
         inet_ok = inet_ok or p["received"] > 0
         extra = ", DNS %d мс" % r["dns_ms"] if r.get("dns_ms") else ""
+        other = via_other(r["ip"])
+        if other:
+            extra += "; идёт через «%s», ответ может давать сам этот VPN" % other["name"]
         rep.add(G, h, _ping_status(p), _fmt_ping(p) + extra, **r)
     ext_ip, ext_err = f_ext.result()
     if ext_ip:
@@ -227,7 +257,7 @@ def run(cfg, progress=None):
 
     # ---- 3. VPN-серверы -----------------------------------------------------
     G = "VPN-серверы"
-    vpn_ok, vpn_fail = [], []
+    vpn_ok, vpn_fail, vpn_via_other = [], [], []
     if not cfg["vpn"]:
         rep.add(G, "Настройки", INFO, "серверы не заданы: добавьте их в раздел [vpn] файла ipinfo.ini")
     for s in cfg["vpn"]:
@@ -254,12 +284,19 @@ def run(cfg, progress=None):
                 st = WARN
         if s["proto"] == "udp" and not p["received"]:
             st = WARN  # UDP-порт проверить нельзя, а ping может быть закрыт
+        other = via_other(r["ip"])
+        if other:
+            vpn_via_other.append("%s через «%s»" % (s["name"], other["name"]))
+            parts.append("подключение идёт через «%s»: на ping и порт может отвечать сам этот "
+                         "VPN" % other["name"])
+            if st == OK:
+                st = WARN
         (vpn_ok if st != FAIL else vpn_fail).append(s["name"])
         rep.add(G, label, st, ", ".join(parts), **r)
 
     # ---- 4. Туннель ---------------------------------------------------------
     G = "Туннель"
-    int_results = {i["name"]: f_int[i["name"]].result() for i in cfg["internal"]}
+    int_results = {i["name"]: f_int[i["name"]].result() for i in internal}
     stats_after = {t["index"]: ad.if_stats(t["index"]) for t in tunnels}
     tunnel_index = {t["index"] for t in tunnels}
     int_ok = int_total = 0
@@ -279,7 +316,7 @@ def run(cfg, progress=None):
             t["name"], ", ".join(t["ipv4"]), ", ".join(t["dns"]) or "-", t["mtu"] or "-"),
             adapter=t)
 
-    for i in cfg["internal"]:
+    for i in internal:
         r = int_results[i["name"]]
         label = "%s (%s)" % (i["name"], i["host"])
         if r["ip"] is None:
@@ -311,8 +348,9 @@ def run(cfg, progress=None):
             continue
         d = {k: a[k] - b[k] for k in a}
         traffic[t["name"]] = {"before": b, "after": a, "delta": d}
-        txt = "за время проверки отправлено %d байт, получено %d байт" % (
-            d["tx_bytes"], d["rx_bytes"])
+        txt = "за время проверки отправлено %d байт, получено %d байт; всего с подключения " \
+              "отправлено %s, получено %s" % (d["tx_bytes"], d["rx_bytes"],
+                                            _mb(a["tx_bytes"]), _mb(a["rx_bytes"]))
         if a["rx_errors"] or a["tx_errors"] or a["rx_discards"]:
             txt += "; ошибки приёма %d, передачи %d, отброшено %d" % (
                 a["rx_errors"], a["tx_errors"], a["rx_discards"])
@@ -324,6 +362,26 @@ def run(cfg, progress=None):
 
     # ---- 5. RDP ---------------------------------------------------------------
     G = "RDP"
+    rdp_out_ok, rdp_out_fail = [], []
+    for t, f in zip(cfg.get("rdp_targets", []), f_rdpt):
+        r = f.result()
+        label = "%s:%d" % (t["host"], t["port"])
+        if r["ip"] is None:
+            rdp_out_fail.append(label)
+            rep.add(G, label, FAIL, r["dns_error"], **r)
+            continue
+        idx = ad.best_interface(r["ip"])
+        via = by_index.get(idx)
+        route = " через «%s»" % via["name"] if via else ""
+        if r["tcp_ok"]:
+            rdp_out_ok.append(label)
+            rep.add(G, label, OK, "порт RDP открыт за %d мс%s" % (r["tcp"], route), **r)
+        else:
+            rdp_out_fail.append(label)
+            rep.add(G, label, FAIL, "%s%s" % (r["tcp"], route), **r)
+    if not cfg.get("rdp_targets"):
+        rep.add(G, "Настройки", INFO,
+                "RDP-серверы не заданы: добавьте их в раздел [rdp] targets файла ipinfo.ini")
     rdp = f_rdp.result() if f_rdp else None
     fw = f_fw.result() if f_fw else None
     rdp_problems = []
@@ -345,6 +403,8 @@ def run(cfg, progress=None):
         "rdp": rdp,
         "net_devices": devices,
         "other_vpn": [a["name"] for a in other_vpn],
+        "vpn_via_other": vpn_via_other,
+        "rdp_out": {"ok": rdp_out_ok, "fail": rdp_out_fail},
         "firewall": fw,
         "checks": rep.checks,
     }
@@ -353,6 +413,25 @@ def run(cfg, progress=None):
                               tunnels=tunnels, int_ok=int_ok, int_total=int_total,
                               rdp_problems=rdp_problems, device_problems=device_problems)
     return data
+
+
+def _auto_internal(tunnels, cfg):
+    """Если внутренние адреса не заданы - проверяем DNS-серверы туннеля из сети 10.x."""
+    try:
+        tnet = ipaddress.IPv4Network(cfg["tunnel_network"], strict=False)
+    except ValueError:
+        return []
+    seen, res = set(), []
+    for t in tunnels:
+        for d in t.get("dns", []):
+            if d not in seen and _in(d, tnet):
+                seen.add(d)
+                res.append({"name": "DNS туннеля", "host": d})
+    return res
+
+
+def _mb(n):
+    return "%.1f МБ" % (n / 1048576.0) if n >= 104857 else "%d КБ" % (n // 1024)
 
 
 def _check_vpn_devices(rep, G, devices, cfg):
@@ -481,10 +560,10 @@ def verdict(data, physical, gw_ok, inet_ok, dns_fail, vpn_ok, vpn_fail, tunnels,
     elif dns_fail:
         v.append("Интернет есть, но часть имён не разрешается: проблемы с DNS.")
 
-    if data.get("other_vpn"):
-        v.append("Включён посторонний VPN (%s): он может перехватывать трафик. "
-                 "Если корпоративный VPN или RDP не работают, сначала выключите его."
-                 % ", ".join(data["other_vpn"]))
+    if data.get("vpn_via_other"):
+        v.append("Подключение к VPN-серверу идёт через другой VPN (%s): проверка сервера "
+                 "не показательна, а обрыв того VPN может оборвать и корпоративный."
+                 % ", ".join(data["vpn_via_other"]))
 
     if vpn_fail and inet_ok:
         if vpn_ok:
@@ -519,13 +598,18 @@ def verdict(data, physical, gw_ok, inet_ok, dns_fail, vpn_ok, vpn_fail, tunnels,
             v.append("Туннель %s поднят. Для проверки трафика добавьте внутренние адреса "
                      "в раздел [internal]." % names)
         if rdp_problems:
-            v.append("RDP к этому ПК не заработает: " + "; ".join(rdp_problems) + ".")
-        elif data.get("rdp") and (int_ok or not int_total):
-            v.append("ПК готов принимать RDP по адресу %s:%d." % (
-                tunnels[0]["tunnel_ip"], data["rdp"]["port"]))
-        elif data.get("rdp"):
-            v.append("Настройки RDP на ПК в порядке, но по RDP не подключиться, "
-                     "пока не работает туннель.")
+            v.append("Входящий RDP к этому ПК не заработает: " + "; ".join(rdp_problems) + ".")
+    out = data.get("rdp_out") or {}
+    if out.get("fail"):
+        hint = " Туннель при этом работает: вероятно, сервер выключен или порт закрыт " \
+               "на его стороне." if tunnels and int_ok else ""
+        v.append("RDP-серверы недоступны: %s.%s" % (", ".join(out["fail"]), hint))
+    elif out.get("ok"):
+        v.append("RDP-серверы доступны: %s." % ", ".join(out["ok"]))
+    problems = (not tunnels) or out.get("fail") or (int_total and not int_ok) or vpn_fail
+    if data.get("other_vpn") and problems:
+        v.append("Также включён другой VPN (%s). Если проблема не объясняется выше, "
+                 "проверьте с выключенным." % ", ".join(data["other_vpn"]))
     if not v:
         v.append("Проблем не найдено.")
     return v
