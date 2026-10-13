@@ -104,7 +104,43 @@ def vpn_connection(links, ips, srv, cfg):
     if used:
         return OK, "клиент подключён к %s (отдельный маршрут к серверу)" % ", ".join(used), \
             used, {"links": sl}
+    # Адреса не из DNS: VPN-клиенты ставят маршрут /32 к своему серверу через шлюз
+    # провайдера, чтобы соединение с сервером не ушло в собственный туннель.
+    routes = []
+    for rt in links.get("routes", []):
+        ip = (rt.get("prefix") or "").split("/")[0]
+        hop = rt.get("nexthop") or ""
+        if _is_public(ip) and hop not in ("", "0.0.0.0") and ip not in routes:
+            routes.append(ip)
+    if routes:
+        return WARN, "соединений с адресами из DNS нет, но есть отдельные маршруты к внешним " \
+            "адресам через шлюз: %s - вероятно, к ним и подключён клиент; этих адресов нет " \
+            "в ответе DNS для %s" % (", ".join(routes), srv["host"]), routes, \
+            {"host_routes": routes}
+    others = []
+    for c in links.get("tcp", []):
+        if (port is None or c.get("rport") == port) and _is_public(c.get("remote")) \
+                and not winsys._proc_matches(c, winsys.PROXY_PROCS + BROWSERS):
+            ep = "%s → %s" % (c.get("process") or "?", c["remote"])
+            if ep not in others:
+                others.append(ep)
+    if others:
+        return INFO, "соединений клиента не найдено; другие программы на порт %s: %s" % (
+            port, ", ".join(others[:8])), [], {}
     return None
+
+
+BROWSERS = ("chrome", "msedge", "firefox", "opera", "yandex", "browser", "brave", "vivaldi",
+            "telegram", "discord", "steam", "onedrive", "teams", "outlook", "searchhost",
+            "svchost", "msedgewebview2", "widgets")
+
+
+def _is_public(ip):
+    try:
+        a = ipaddress.IPv4Address(ip)
+    except (ValueError, TypeError):
+        return False
+    return a.is_global
 
 
 def classify(adapter_list, cfg):

@@ -311,6 +311,14 @@ class DiagnoseTest(unittest.TestCase):
         self.assertEqual(st, diagnose.WARN)
         self.assertIn("нет в ответе DNS", text)
 
+    def test_vpn_connection_from_host_route(self):
+        srv = {"name": "ztn", "host": "vpng.example.ru", "port": 443, "proto": "tcp"}
+        links = {"tcp": [], "routes": [{"prefix": "8.8.4.4/32", "nexthop": "192.168.1.1"},
+                                       {"prefix": "10.1.1.1/32", "nexthop": "10.0.0.1"}]}
+        st, text, used, _ = diagnose.vpn_connection(links, ["1.2.3.4"], srv, self.cfg)
+        self.assertEqual(used, ["8.8.4.4"])
+        self.assertIn("отдельные маршруты", text)
+
     def test_vpn_server_with_two_ips(self):
         self.cfg["vpn"] = [{"name": "ztn", "host": "vpng.example.ru", "port": 443,
                             "proto": "tcp"}]
