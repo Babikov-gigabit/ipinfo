@@ -50,6 +50,18 @@ def _match_client(adapter, patterns):
     return None
 
 
+def _other_vpn(adapter_list, cfg):
+    """Включённые адаптеры посторонних VPN (Happ/sing-box, WireGuard и т.п.)."""
+    res = []
+    for a in adapter_list:
+        if not a["up"] or a.get("loopback") or _match_client(a, cfg["patterns"]):
+            continue
+        text = ("%s %s" % (a.get("name", ""), a.get("description", ""))).lower()
+        if any(w.lower() in text for w in cfg.get("other_vpn", [])):
+            res.append(a)
+    return res
+
+
 def classify(adapter_list, cfg):
     """Делит адаптеры на туннели VPN, локальные и установленные, но не поднятые VPN."""
     try:
@@ -58,10 +70,13 @@ def classify(adapter_list, cfg):
         tnet = ipaddress.IPv4Network("10.0.0.0/8")
 
     tunnels, local, idle_vpn, lan_conflicts = [], [], [], []
+    other = _other_vpn(adapter_list, cfg)
     for a in adapter_list:
         if a.get("loopback"):
             continue
         client = _match_client(a, cfg["patterns"])
+        if not client and a in other:
+            continue
         in_tnet = [ip for ip in ad.ipv4_addrs(a) if _in(ip, tnet)]
         if a["up"] and in_tnet and (client or a.get("iftype") not in (6, 71)):
             tunnels.append(dict(a, client=client or "VPN (не опознан)", tunnel_ip=in_tnet[0]))
@@ -165,6 +180,11 @@ def run(cfg, progress=None):
             rep.add(G, name, OK, "%s, шлюз %s, DNS %s" % (
                 ", ".join(a["ipv4"]), ", ".join(a["gateway"]), ", ".join(a["dns"]) or "-"),
                 adapter=a)
+    other_vpn = _other_vpn(all_adapters, cfg)
+    for a in other_vpn:
+        rep.add(G, "Посторонний VPN", WARN,
+                "включён «%s» (%s): он может перехватывать трафик и мешать корпоративному "
+                "туннелю и RDP" % (a["name"], a["description"]), adapter=a["name"])
     for a in lan_conflicts:
         rep.add(G, "Конфликт адресов", WARN,
                 "сеть «%s» использует %s: тот же диапазон, что у корпоративной сети. "
@@ -324,6 +344,7 @@ def run(cfg, progress=None):
         "external_ip": ext_ip,
         "rdp": rdp,
         "net_devices": devices,
+        "other_vpn": [a["name"] for a in other_vpn],
         "firewall": fw,
         "checks": rep.checks,
     }
@@ -459,6 +480,11 @@ def verdict(data, physical, gw_ok, inet_ok, dns_fail, vpn_ok, vpn_fail, tunnels,
             v.append("Роутер отвечает, но интернета нет: проблема у провайдера.")
     elif dns_fail:
         v.append("Интернет есть, но часть имён не разрешается: проблемы с DNS.")
+
+    if data.get("other_vpn"):
+        v.append("Включён посторонний VPN (%s): он может перехватывать трафик. "
+                 "Если корпоративный VPN или RDP не работают, сначала выключите его."
+                 % ", ".join(data["other_vpn"]))
 
     if vpn_fail and inet_ok:
         if vpn_ok:

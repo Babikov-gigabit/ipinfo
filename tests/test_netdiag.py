@@ -233,6 +233,14 @@ class DiagnoseTest(unittest.TestCase):
         d = self.run_diag([self.lan, self.vpn], devices=[])
         self.assertFalse(any(c["name"].startswith("Адаптер") for c in d["checks"]))
 
+    def test_other_vpn_warning(self):
+        happ = adapter("happ-tun", ["172.19.0.1/30"], iftype=53, index=12,
+                       desc="sing-tun Tunnel")
+        d = self.run_diag([self.lan, happ, self.vpn])
+        self.assertEqual(d["other_vpn"], ["happ-tun"])
+        self.assertIn("посторонний VPN (happ-tun)", " ".join(d["verdict"]))
+        self.assertEqual(d["tunnels"], ["Continent 4"])
+
     def test_report_text_and_zip(self):
         d = self.run_diag([self.lan, self.vpn])
         text = report.format_text(d)

@@ -35,6 +35,9 @@ network = 10.0.0.0/8
 ; Части названия или описания адаптера, по которым узнаётся VPN-клиент.
 continent = Continent, Континент, Код Безопасности, Security Code, ZTN
 openconnect = OpenConnect, Wintun, TAP-Windows
+; Посторонние VPN и прокси-туннели: если такой адаптер включён, он может
+; перехватывать трафик и ломать корпоративный туннель.
+other = sing-tun, happ, WireGuard, AmneziaWG, Amnezia, Clash, v2ray, Xray, Hiddify, Nekoray, Outline, Proton, NordLynx, Radmin, Hamachi, ZeroTier, Tailscale, OpenVPN
 
 [rdp]
 ; Проверять ли готовность ПК принимать входящие RDP-подключения через туннель.
@@ -125,6 +128,7 @@ def load(path=None):
             "Континент": _split(cp.get("tunnel", "continent", fallback="")),
             "OpenConnect": _split(cp.get("tunnel", "openconnect", fallback="")),
         },
+        "other_vpn": _split(cp.get("tunnel", "other", fallback="")),
         "rdp": cp.getboolean("rdp", "enabled", fallback=True),
         "rdp_sources": _split(cp.get("rdp", "sources", fallback="")),
         "logs": {n: os.path.expandvars(v.strip()) for n, v in cp.items("logs") if v.strip()},
