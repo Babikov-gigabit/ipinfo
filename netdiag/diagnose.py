@@ -9,6 +9,7 @@
   5. готовность ПК принимать RDP через туннель.
 """
 
+import collections
 import concurrent.futures
 import datetime
 import ipaddress
@@ -184,6 +185,7 @@ def run(cfg, progress=None):
     f_rdp = pool.submit(winsys.rdp_info) if cfg["rdp"] else None
     f_fw = pool.submit(winsys.firewall_info) if cfg["rdp"] else None
     f_dev = pool.submit(winsys.net_devices)
+    f_rdplog = pool.submit(winsys.rdp_client_events, 24 * 60)
 
     # ---- 1. Локальная сеть ------------------------------------------------
     G = "Локальная сеть"
@@ -379,6 +381,15 @@ def run(cfg, progress=None):
         else:
             rdp_out_fail.append(label)
             rep.add(G, label, FAIL, "%s%s" % (r["tcp"], route), **r)
+    rdp_log = f_rdplog.result()
+    drops = [e for e in rdp_log or [] if e.get("id") == 1026 and e.get("reason") not in (1, 2)]
+    if drops:
+        by_reason = collections.Counter(e.get("reason_text") for e in drops)
+        rep.add(G, "Обрывы за сутки", WARN, "%d: %s; последний %s" % (
+            len(drops), "; ".join("%s - %d" % kv for kv in by_reason.most_common()),
+            drops[-1]["time"][:19].replace("T", " ")), events=drops)
+    elif rdp_log is not None:
+        rep.add(G, "Обрывы за сутки", OK, "по журналу клиента RDP обрывов не было")
     if not cfg.get("rdp_targets"):
         rep.add(G, "Настройки", INFO,
                 "RDP-серверы не заданы: добавьте их в раздел [rdp] targets файла ipinfo.ini")
@@ -401,6 +412,7 @@ def run(cfg, progress=None):
         "wifi": wifi,
         "external_ip": ext_ip,
         "rdp": rdp,
+        "rdp_client_events": rdp_log,
         "net_devices": devices,
         "other_vpn": [a["name"] for a in other_vpn],
         "vpn_via_other": vpn_via_other,

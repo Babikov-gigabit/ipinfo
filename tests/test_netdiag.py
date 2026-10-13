@@ -10,7 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from netdiag import adapters as ad, config, diagnose, probes, report, winsys  # noqa: E402
+from netdiag import adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
 
 
 def adapter(name, ipv4=(), up=True, iftype=6, gateway=(), dns=(), index=1, desc=""):
@@ -283,6 +283,17 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("RDP-серверы недоступны: 10.0.0.6:3389", v)
         self.assertIn("Туннель при этом работает", v)
 
+    def test_rdp_drops_last_day(self):
+        evs = [{"time": "2026-10-13T10:00:00.0000000+03:00", "id": 1026, "reason": 2308,
+                "reason_text": winsys.RDP_DISCONNECT_REASON[2308]},
+               {"time": "2026-10-13T11:00:00.0000000+03:00", "id": 1026, "reason": 1,
+                "reason_text": winsys.RDP_DISCONNECT_REASON[1]}]
+        with mock.patch.object(winsys, "rdp_client_events", return_value=evs):
+            d = self.run_diag([self.lan, self.vpn])
+        c = next(c for c in d["checks"] if c["name"] == "Обрывы за сутки")
+        self.assertEqual(c["status"], "warn")
+        self.assertTrue(c["summary"].startswith("1: соединение потеряно"))
+
     def test_report_text_and_zip(self):
         d = self.run_diag([self.lan, self.vpn])
         text = report.format_text(d)
@@ -302,6 +313,88 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("report.json", names)
         self.assertIn("vpn_logs/continent/a.log", names)
         self.assertIn("system/x.txt", names)
+
+
+class MonitorTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.patch = mock.patch.object(monitor, "logs_dir", return_value=self.tmp.name)
+        self.patch.start()
+        cfg = config.load(os.devnull + "-missing")
+        self.events = []
+        self.m = monitor.Monitor(cfg, interval=2, on_event=lambda ev, line: self.events.append(ev))
+        self.m.state = {"tunnels": {"Continent": "10.1.1.1"}, "physical": {}, "other_vpn": []}
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def test_probe_goes_down_after_two_fails_and_back(self):
+        p = monitor.Probe("internal", "туннель 10.0.0.1", "10.0.0.1")
+        self.m.probes = [p]
+        self.m._update_probe(p, True, 10, 100)
+        self.m._update_probe(p, False, None, 102)
+        self.assertEqual(self.events, [])  # одна потеря - ещё не обрыв
+        self.m._update_probe(p, False, None, 104)
+        self.assertEqual(self.events[-1]["level"], "fail")
+        self.m._update_probe(p, True, 10, 110)
+        self.assertIn("снова отвечает", self.events[-1]["text"])
+        self.assertEqual(p.drops, 1)
+        self.assertTrue(os.path.exists(self.m.text_path))
+
+    def test_tunnel_lost_event(self):
+        old = {"tunnels": {"Continent": "10.1.1.1"}, "physical": {}, "other_vpn": []}
+        new = {"tunnels": {}, "physical": {}, "other_vpn": ["happ-tun"]}
+        self.m._diff_snapshot(old, new)
+        texts = " ".join(e["text"] for e in self.events)
+        self.assertIn("туннель «Continent» пропал", texts)
+        self.assertIn("другой VPN: выключен → happ-tun", texts)
+
+    def test_wifi_roaming(self):
+        self.m._diff_wifi({"bssid": "aa", "signal_pct": 80}, {"bssid": "bb", "signal_pct": 35})
+        texts = " ".join(e["text"] for e in self.events)
+        self.assertIn("другую точку", texts)
+        self.assertIn("слабый сигнал", texts)
+
+    def _hist(self, **over):
+        self.m.probes = [monitor.Probe("gateway", "роутер", "1"),
+                         monitor.Probe("internet", "интернет", "2"),
+                         monitor.Probe("internal", "туннель", "3")]
+        base = {"probes": {"роутер": True, "интернет": True, "туннель": True},
+                "tunnel": True, "other_vpn": [], "wifi": "aa"}
+        self.m.history.clear()
+        for i in range(10):
+            t = dict(base, t=1000 + i * 2, probes=dict(base["probes"]))
+            if i == 8:
+                for k, v in over.items():
+                    if k in t["probes"]:
+                        t["probes"][k] = v
+                    else:
+                        t[k] = v
+            self.m.history.append(t)
+        return self.m.explain_disconnect(at=1018)
+
+    def test_explain_disconnect(self):
+        self.assertIn("туннель VPN", self._hist(tunnel=False))
+        self.assertIn("роутер", self._hist(**{"роутер": False}))
+        self.assertIn("провайдера", self._hist(**{"интернет": False}))
+        self.assertIn("трафик через туннель не шёл", self._hist(**{"туннель": False}))
+        self.assertIn("другой VPN", self._hist(other_vpn=["happ-tun"]))
+        self.assertIn("обрыв на стороне RDP", self._hist())
+
+    def test_rdp_disconnect_from_log(self):
+        self._hist(**{"туннель": False})
+        ev = {"time": None, "id": 1026, "props": ["2308"], "reason": 2308,
+              "reason_text": winsys.RDP_DISCONNECT_REASON[2308]}
+        with mock.patch.object(winsys, "rdp_client_events", return_value=[ev]), \
+                mock.patch.object(self.m, "explain_disconnect", return_value="X"):
+            self.m._check_rdp_log(set())
+        self.assertIn("сеанс отключён", self.events[-1]["text"])
+        self.assertIn("2308", self.events[-1]["text"])
+
+    def test_event_epoch(self):
+        self.assertIsNotNone(monitor._event_epoch("2026-10-13T18:22:54.1234567+03:00"))
+        self.assertIsNone(monitor._event_epoch("bad"))
 
 
 if __name__ == "__main__":

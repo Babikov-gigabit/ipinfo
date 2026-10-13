@@ -130,6 +130,10 @@ def build_zip(data, cfg, path=None):
         z.writestr("report.json", json.dumps(data, ensure_ascii=False, indent=2, default=str))
         for name, text in winsys.system_dumps().items():
             z.writestr("system/" + name, text)
+        rdp_events = winsys.rdp_client_events(3 * 24 * 60)
+        if rdp_events is not None:
+            z.writestr("system/rdp_client_events.json",
+                       json.dumps(rdp_events, ensure_ascii=False, indent=2))
         if cfg.get("path") and os.path.exists(cfg["path"]):
             z.write(cfg["path"], "ipinfo.ini")
         for f in sorted(glob.glob(os.path.join(logs_dir(), "*"))):

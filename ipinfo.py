@@ -23,7 +23,7 @@ import sys
 import threading
 import traceback
 
-from netdiag import __version__, adapters as ad, config, diagnose, probes, report
+from netdiag import __version__, adapters as ad, config, diagnose, monitor, probes, report
 from netdiag.sysutil import attach_console, resource_path
 
 ICON_NAME = "ip-icon.ico"
@@ -182,6 +182,7 @@ def run_gui(include_down, want_external, cfg_path=None):
 
     reload_btn = head_button("↻", 13)
     check_btn = head_button("ПРОВЕРКА")
+    monitor_btn = head_button("МОНИТОРИНГ")
 
     # --- прокручиваемая область ----------------------------------------
     canvas = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0)
@@ -446,8 +447,109 @@ def run_gui(include_down, want_external, cfg_path=None):
         w.bind("<Escape>", lambda _e: w.destroy())
         start()
 
+    # --- окно мониторинга --------------------------------------------
+    def open_monitor(_e=None):
+        if state.get("mon_win") and state["mon_win"].winfo_exists():
+            state["mon_win"].deiconify()
+            state["mon_win"].lift()
+            return
+        cfg_file = cfg_path or config.ensure_config()
+        cfg = config.load(cfg_file)
+
+        w = tk.Toplevel(root)
+        state["mon_win"] = w
+        w.title("Мониторинг связи")
+        w.configure(bg=BG)
+        w.geometry("720x480")
+        try:
+            w.iconbitmap(resource_path(ICON_NAME))
+        except Exception:
+            pass
+
+        bar = tk.Frame(w, bg=BG)
+        bar.pack(fill="x", padx=16, pady=(12, 6))
+        status = tk.Label(bar, text="", font=f_head, fg=FG_MUTED, bg=BG)
+        status.pack(side="left")
+        txt = tk.Text(w, font=("Consolas", 9), bg=BG, fg=FG, relief="flat", wrap="word",
+                      padx=16, pady=8, highlightthickness=0, state="disabled")
+        sb = tk.Scrollbar(w, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        for k, color in STATUS_COLOR.items():
+            txt.tag_configure(k, foreground=color)
+
+        mon_state = {"mon": None, "fails": 0}
+
+        def put(line, level):
+            txt.configure(state="normal")
+            txt.insert("end", line + "\n", (level,))
+            txt.see("end")
+            txt.configure(state="disabled")
+
+        def on_event(ev, line):
+            def show():
+                put(line, ev["level"])
+                if ev["level"] == "fail":
+                    mon_state["fails"] += 1
+                if mon_state["mon"] and not mon_state["mon"].stop_event.is_set():
+                    status.config(text="идёт мониторинг · событий с ошибками: %d"
+                                  % mon_state["fails"], fg=FG_FAIL if mon_state["fails"] else FG_OK)
+            ui_queue.put(show)
+
+        def start(_e=None):
+            if mon_state["mon"] and not mon_state["mon"].stop_event.is_set():
+                return
+            mon_state["fails"] = 0
+            m = monitor.Monitor(cfg, interval=2, on_event=on_event)
+            mon_state["mon"] = m
+            put("журнал: %s" % m.text_path, "info")
+            status.config(text="идёт мониторинг", fg=FG_OK)
+            m.start()
+
+        def stop(_e=None):
+            if mon_state["mon"]:
+                mon_state["mon"].stop()
+                status.config(text="остановлен", fg=FG_MUTED)
+
+        def save_report(_e=None):
+            status.config(text="собираю отчёт…", fg=FG_MUTED)
+
+            def work():
+                data = diagnose.run(cfg)
+                report.save_check(data)
+                return report.build_zip(data, cfg)
+
+            def done(path):
+                if isinstance(path, Exception):
+                    status.config(text="отчёт не собран: %s" % path, fg=FG_FAIL)
+                    return
+                status.config(text="отчёт сохранён", fg=FG_OK)
+                put("отчёт: %s" % path, "info")
+                _show_in_explorer(path)
+
+            in_background(work, done)
+
+        def on_close():
+            if mon_state["mon"] and not mon_state["mon"].stop_event.is_set():
+                if not messagebox.askyesno("IPInfo", "Остановить мониторинг?\n\n"
+                                           "Чтобы он продолжал работать, сверните окно."):
+                    return
+                stop()
+            w.destroy()
+
+        for text, cmd in (("отчёт", save_report), ("стоп", stop), ("старт", start)):
+            b = tk.Label(bar, text=text, font=f_meta, fg=FG_MUTED, bg=BG, cursor="hand2")
+            b.pack(side="right", padx=(12, 0))
+            b.bind("<Button-1>", cmd)
+            b.bind("<Enter>", lambda _e, b=b: b.config(fg=FG))
+            b.bind("<Leave>", lambda _e, b=b: b.config(fg=FG_MUTED))
+        w.protocol("WM_DELETE_WINDOW", on_close)
+        start()
+
     reload_btn.bind("<Button-1>", refresh)
     check_btn.bind("<Button-1>", open_check)
+    monitor_btn.bind("<Button-1>", open_monitor)
     root.bind("<F5>", refresh)
     root.bind("<Escape>", lambda _e: root.destroy())
 
@@ -481,6 +583,10 @@ def main():
     p.add_argument("--cli", action="store_true", help="консольный вывод вместо окна")
     p.add_argument("--check", action="store_true", help="полная проверка сети и VPN")
     p.add_argument("--report", action="store_true", help="проверка и zip-отчёт для отправки")
+    p.add_argument("--monitor", action="store_true",
+                   help="фоновый мониторинг обрывов до Ctrl+C (журнал в logs)")
+    p.add_argument("--interval", type=float, default=2.0, metavar="СЕК",
+                   help="интервал мониторинга, по умолчанию 2 с")
     p.add_argument("--all", action="store_true", help="включая выключенные адаптеры")
     p.add_argument("--no-net", action="store_true", help="не запрашивать внешний IP")
     p.add_argument("--json", action="store_true", help="вывод в формате JSON")
@@ -489,6 +595,20 @@ def main():
     args = p.parse_args()
 
     log.info("запуск IPInfo %s, ключи: %s", __version__, " ".join(sys.argv[1:]) or "-")
+
+    if args.monitor:
+        cfg = config.load(args.config or config.ensure_config())
+        m = monitor.Monitor(cfg, interval=args.interval,
+                            on_event=lambda ev, line: print(line, flush=True))
+        print("Журнал: %s\nОстановить: Ctrl+C\n" % m.text_path, flush=True)
+        m.start()
+        try:
+            while m.thread.is_alive():
+                m.thread.join(0.5)
+        except KeyboardInterrupt:
+            m.stop()
+            m.thread.join(30)
+        return
 
     if args.check or args.report:
         cfg = config.load(args.config or config.ensure_config())

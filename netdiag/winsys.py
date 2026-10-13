@@ -274,3 +274,61 @@ def net_devices():
         d["problem_text"] = PNP_PROBLEM.get(code, "ошибка устройства, код %d" % code) \
             if code else ""
     return data
+
+
+# --------------------------------------------------------------------------
+# Журнал клиента RDP (mstsc): подключения и обрывы с кодом причины
+# --------------------------------------------------------------------------
+RDP_CLIENT_LOG = "Microsoft-Windows-TerminalServices-RDPClient/Operational"
+# Коды причины отключения из события 1026 (самые частые)
+RDP_DISCONNECT_REASON = {
+    1: "отключено на этом ПК (пользователь закрыл окно)",
+    2: "отключено с удалённой стороны пользователем",
+    3: "сервер завершил сеанс (простой, ограничение времени или администратор)",
+    264: "истекло время ожидания соединения",
+    516: "не удалось установить соединение с сервером",
+    2308: "соединение потеряно: связь с сервером прервалась (сокет закрыт)",
+    3334: "ошибка протокола RDP",
+}
+RDP_EVENT_TEXT = {
+    1024: "подключение к серверу",
+    1026: "отключение",
+    1027: "подключено к домену",
+    1029: "хэш имени пользователя",
+    1102: "запущено дополнительное UDP-соединение",
+    1103: "UDP-соединение установлено",
+    1105: "UDP-соединение разорвано",
+}
+
+_PS_RDP_EVENTS = r"""
+$start = (Get-Date).AddMinutes(-%d)
+@(Get-WinEvent -FilterHashtable @{LogName='%s'; StartTime=$start} -MaxEvents 500 |
+  Sort-Object TimeCreated | ForEach-Object {
+  @{ time = $_.TimeCreated.ToString('o'); id = $_.Id;
+     props = @($_.Properties | ForEach-Object { [string]$_.Value }) } }) |
+  ConvertTo-Json -Depth 4 -Compress
+"""
+
+
+def rdp_client_events(minutes=60):
+    """События клиента RDP за последние minutes минут. [] если нет, None вне Windows."""
+    if not IS_WINDOWS:
+        return None
+    data = powershell_json(_PS_RDP_EVENTS % (int(minutes), RDP_CLIENT_LOG))
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    for e in data:
+        e["text"] = RDP_EVENT_TEXT.get(e.get("id"), "событие %s" % e.get("id"))
+        props = e.get("props") or []
+        if e.get("id") == 1026 and props:
+            try:
+                code = int(props[0])
+            except ValueError:
+                code = None
+            e["reason"] = code
+            e["reason_text"] = RDP_DISCONNECT_REASON.get(code, "код %s" % props[0])
+        elif e.get("id") == 1024 and props:
+            e["server"] = props[0]
+    return data
