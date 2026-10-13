@@ -1,0 +1,46 @@
+name: Сборка IPInfo.exe
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Тесты
+        run: python -m unittest discover tests -v
+
+      - name: PyInstaller
+        run: python -m pip install pyinstaller
+
+      - name: Сборка exe
+        run: >
+          python -m PyInstaller --onefile --windowed --noupx --clean --noconfirm
+          --name IPInfo --icon ip-icon.ico --add-data "ip-icon.ico;."
+          --version-file version.txt
+          --exclude-module numpy --exclude-module pandas --exclude-module PIL
+          --exclude-module unittest --exclude-module pydoc --exclude-module doctest
+          ipinfo.py
+
+      - name: Проверка запуска
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\IPInfo.exe -ArgumentList '--json','--no-net' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "IPInfo.exe завершился с кодом $($p.ExitCode)" }
+          (Get-FileHash dist\IPInfo.exe -Algorithm SHA256).Hash | Tee-Object dist\IPInfo.exe.sha256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPInfo
+          path: |
+            dist/IPInfo.exe
+            dist/IPInfo.exe.sha256.txt
