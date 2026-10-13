@@ -491,23 +491,24 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(winsys.parse_rdp_event({"id": 1026, "props": ["3"]})["reason"], 3)
 
     def test_rdp_tcp_watch_and_disconnect_details(self):
+        B = 1760000000  # реальное время: на Windows timestamp() около 1970 года падает
         conn = {"remote": "10.61.220.15", "rport": 3389, "lport": 50000, "pid": 7,
                 "process": "mstsc"}
         other = {"remote": "1.1.1.1", "rport": 443, "lport": 50001, "pid": 8,
                  "process": "chrome"}
         with mock.patch.object(monitor.ad, "tcp_connections", side_effect=[
                 [conn, other], [dict(conn)], [other]]):
-            self.assertEqual(self.m._check_rdp_tcp(1000), 1)
-            self.m._check_rdp_tcp(1002)
-            self.assertEqual(self.m._check_rdp_tcp(1004), 0)
+            self.assertEqual(self.m._check_rdp_tcp(B + 1000), 1)
+            self.m._check_rdp_tcp(B + 1002)
+            self.assertEqual(self.m._check_rdp_tcp(B + 1004), 0)
         self.assertIn("закрыто", self.events[-1]["text"])
-        self.m.rdp_session = {"server": "10.61.220.15", "t": 400}
-        self.m.rdp_udp_lost = 990
-        self.m.history.append({"t": 1000, "probes": {}, "tunnel": True, "other_vpn": []})
+        self.m.rdp_session = {"server": "10.61.220.15", "t": B + 400}
+        self.m.rdp_udp_lost = B + 990
+        self.m.history.append({"t": B + 1000, "probes": {}, "tunnel": True, "other_vpn": []})
         with mock.patch.object(self.m, "_route_of", return_value="Continent"):
             text = self.m.describe_disconnect({"id": 1026, "reason": 2308,
                                                "time": datetime.datetime.fromtimestamp(
-                                                   1005).isoformat()})
+                                                   B + 1005).isoformat()})
         self.assertIn("длился 10 мин 5 с", text)
         self.assertIn("UDP-канал RDP разорвался", text)
         self.assertIn("TCP-соединение mstsc → 10.61.220.15:3389 закрылось", text)

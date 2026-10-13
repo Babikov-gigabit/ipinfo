@@ -50,7 +50,7 @@ def _event_epoch(iso):
     iso = re.sub(r"(\.\d{6})\d+", r"\1", iso)
     try:
         return datetime.datetime.fromisoformat(iso).timestamp()
-    except ValueError:
+    except (ValueError, OSError, OverflowError):
         return None
 
 
