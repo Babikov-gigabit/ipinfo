@@ -9,6 +9,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -44,3 +46,20 @@ jobs:
           path: |
             dist/IPInfo.exe
             dist/IPInfo.exe.sha256.txt
+
+      # Ручной запуск кладёт exe в ветку test-build: оттуда его можно забрать
+      # через git, без доступа к хранилищу артефактов Actions.
+      - name: Публикация в ветку test-build
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          $sha = git rev-parse --short HEAD
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item dist\IPInfo.exe, dist\IPInfo.exe.sha256.txt out\
+          Set-Location out
+          git init -q -b test-build
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -q -m "IPInfo.exe из $sha"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" test-build
