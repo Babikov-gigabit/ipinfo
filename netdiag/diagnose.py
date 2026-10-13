@@ -142,6 +142,7 @@ def run(cfg, progress=None):
     f_wifi = pool.submit(winsys.wifi_info)
     f_rdp = pool.submit(winsys.rdp_info) if cfg["rdp"] else None
     f_fw = pool.submit(winsys.firewall_info) if cfg["rdp"] else None
+    f_dev = pool.submit(winsys.net_devices)
 
     # ---- 1. Локальная сеть ------------------------------------------------
     G = "Локальная сеть"
@@ -243,6 +244,8 @@ def run(cfg, progress=None):
     tunnel_index = {t["index"] for t in tunnels}
     int_ok = int_total = 0
 
+    devices = f_dev.result()
+    device_problems = _check_vpn_devices(rep, G, devices, cfg) if not tunnels else []
     if not tunnels:
         if idle_vpn:
             rep.add(G, "Состояние", FAIL, "туннель не поднят. Установлено: %s" % ", ".join(
@@ -320,14 +323,56 @@ def run(cfg, progress=None):
         "wifi": wifi,
         "external_ip": ext_ip,
         "rdp": rdp,
+        "net_devices": devices,
         "firewall": fw,
         "checks": rep.checks,
     }
     data["verdict"] = verdict(data, physical=physical, gw_ok=gw_ok, inet_ok=inet_ok,
                               dns_fail=dns_fail, vpn_ok=vpn_ok, vpn_fail=vpn_fail,
                               tunnels=tunnels, int_ok=int_ok, int_total=int_total,
-                              rdp_problems=rdp_problems)
+                              rdp_problems=rdp_problems, device_problems=device_problems)
     return data
+
+
+def _check_vpn_devices(rep, G, devices, cfg):
+    """Есть ли в системе виртуальные адаптеры VPN-клиентов и исправны ли они.
+
+    Возвращает строки для итога. Пусто, если данных нет (не Windows).
+    """
+    if devices is None:
+        return []
+    problems = []
+    main_client = next(iter(cfg["patterns"]), None)  # основной клиент - первый в списке
+    for client, words in cfg["patterns"].items():
+        found = [d for d in devices if any(
+            w.lower() in ("%s %s" % (d.get("name") or "", d.get("description") or "")).lower()
+            for w in words)]
+        if not found:
+            rep.add(G, "Адаптер %s" % client, WARN if client == main_client else INFO,
+                    "виртуальный адаптер не найден в диспетчере устройств")
+            if client != main_client:
+                continue  # резервный клиент может быть просто не установлен
+            problems.append(
+                "Виртуальный адаптер %s не найден в системе: клиент не сможет подключиться. "
+                "Драйвер адаптера не установлен или удалён (бывает после обновления Windows "
+                "или антивируса) - нужна переустановка клиента %s." % (client, client))
+            continue
+        for d in found:
+            name = d.get("name") or d.get("description") or "?"
+            if d.get("problem"):
+                text = d["problem_text"]
+                if d["problem"] == 22:
+                    text += ": включите его в «Сетевых подключениях» (ncpa.cpl)"
+                rep.add(G, "Адаптер «%s»" % name, FAIL, text, device=d)
+                problems.append("Адаптер %s «%s»: %s." % (client, name, text))
+            elif d.get("present") is False:
+                rep.add(G, "Адаптер «%s»" % name, FAIL,
+                        "записан в системе, но устройство отсутствует", device=d)
+                problems.append("Адаптер %s «%s» записан в системе, но устройство "
+                                "отсутствует: переустановите клиент %s." % (client, name, client))
+            else:
+                rep.add(G, "Адаптер «%s»" % name, OK, "установлен и исправен", device=d)
+    return problems
 
 
 def _check_rdp(rep, G, rdp, fw, tunnels, by_index, cfg):
@@ -399,7 +444,7 @@ def _check_rdp(rep, G, rdp, fw, tunnels, by_index, cfg):
 # Итог
 # --------------------------------------------------------------------------
 def verdict(data, physical, gw_ok, inet_ok, dns_fail, vpn_ok, vpn_fail, tunnels,
-            int_ok, int_total, rdp_problems):
+            int_ok, int_total, rdp_problems, device_problems=()):
     """Короткий вывод для человека: что сломано и на каком участке."""
     v = []
     if not physical:
@@ -425,6 +470,7 @@ def verdict(data, physical, gw_ok, inet_ok, dns_fail, vpn_ok, vpn_fail, tunnels,
 
     if not tunnels:
         v.append("Туннель VPN не поднят.")
+        v.extend(device_problems)
     else:
         names = ", ".join("%s (%s)" % (t["client"], t["tunnel_ip"]) for t in tunnels)
         route_fail = [c for c in data["checks"]

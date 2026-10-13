@@ -139,7 +139,7 @@ class DiagnoseTest(unittest.TestCase):
                            desc="Continent TLS Adapter")
 
     def run_diag(self, adapters, ping=None, best=None, stats=None, tcp=(True, 20),
-                 ext=("8.8.4.4", None)):
+                 ext=("8.8.4.4", None), devices=None):
         ping = ping or {}
         stats = stats or {}
         with mock.patch.object(ad, "get_adapters", return_value=adapters), \
@@ -153,6 +153,7 @@ class DiagnoseTest(unittest.TestCase):
                                   (best or {}).get(ip, 9)), \
                 mock.patch.object(ad, "if_stats", side_effect=lambda idx:
                                   stats.pop(0) if isinstance(stats, list) and stats else None), \
+                mock.patch.object(winsys, "net_devices", return_value=devices), \
                 mock.patch.object(winsys, "wifi_info", return_value=None):
             return diagnose.run(self.cfg)
 
@@ -213,6 +214,24 @@ class DiagnoseTest(unittest.TestCase):
         v = " ".join(d["verdict"])
         self.assertIn("RDP к этому ПК не заработает", v)
         self.assertIn("Общедоступная", v)
+
+    def test_continent_adapter_missing(self):
+        devs = [{"name": "Intel Ethernet", "status": "OK", "problem": 0, "present": True,
+                 "problem_text": ""}]
+        d = self.run_diag([self.lan], devices=devs)
+        v = " ".join(d["verdict"])
+        self.assertIn("Виртуальный адаптер Континент не найден", v)
+        self.assertNotIn("OpenConnect", v)
+
+    def test_continent_adapter_disabled(self):
+        devs = [{"name": "Континент 4 Virtual Adapter", "status": "Error", "problem": 22,
+                 "present": True, "problem_text": winsys.PNP_PROBLEM[22]}]
+        d = self.run_diag([self.lan], devices=devs)
+        self.assertIn("адаптер отключён", " ".join(d["verdict"]))
+
+    def test_devices_not_checked_when_tunnel_up(self):
+        d = self.run_diag([self.lan, self.vpn], devices=[])
+        self.assertFalse(any(c["name"].startswith("Адаптер") for c in d["checks"]))
 
     def test_report_text_and_zip(self):
         d = self.run_diag([self.lan, self.vpn])

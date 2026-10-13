@@ -226,3 +226,51 @@ def system_dumps():
             "resolv_conf.txt": ["cat", "/etc/resolv.conf"],
         }
     return {name: run(cmd, timeout=30) for name, cmd in cmds.items()}
+
+
+# --------------------------------------------------------------------------
+# Сетевые устройства в диспетчере устройств (в т.ч. отключённые и сломанные)
+# --------------------------------------------------------------------------
+# GetAdaptersAddresses не видит отключённые адаптеры и адаптеры с ошибкой
+# драйвера, а именно так выглядит «Виртуальный адаптер Континент 4 не найден».
+PNP_PROBLEM = {
+    1: "устройство настроено неправильно",
+    10: "устройство не может запуститься",
+    18: "нужно переустановить драйвер",
+    19: "повреждены настройки устройства в реестре",
+    21: "Windows удаляет устройство",
+    22: "адаптер отключён",
+    24: "устройство отсутствует или не работает",
+    28: "драйвер не установлен",
+    31: "Windows не может загрузить драйвер",
+    32: "служба драйвера отключена",
+    37: "драйвер не смог запуститься",
+    39: "драйвер повреждён или отсутствует",
+    43: "устройство сообщило о сбое",
+    45: "устройство сейчас не подключено (драйвер не загружен)",
+    48: "драйвер заблокирован",
+    52: "не удалось проверить цифровую подпись драйвера",
+}
+
+_PS_NET_DEVICES = r"""
+@(Get-PnpDevice -Class Net | ForEach-Object {
+  @{ name = $_.FriendlyName; description = $_.Description; status = [string]$_.Status;
+     problem = [int]$_.Problem; present = [bool]$_.Present; id = $_.InstanceId } }) |
+  ConvertTo-Json -Depth 3 -Compress
+"""
+
+
+def net_devices():
+    """Все сетевые устройства из диспетчера устройств с кодами ошибок. None вне Windows."""
+    if not IS_WINDOWS:
+        return None
+    data = powershell_json(_PS_NET_DEVICES)
+    if isinstance(data, dict):  # ConvertTo-Json отдаёт объект, если устройство одно
+        data = [data]
+    if not isinstance(data, list):
+        return None
+    for d in data:
+        code = d.get("problem") or 0
+        d["problem_text"] = PNP_PROBLEM.get(code, "ошибка устройства, код %d" % code) \
+            if code else ""
+    return data

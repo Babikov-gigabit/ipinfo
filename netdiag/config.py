@@ -33,7 +33,7 @@ targets = 1.1.1.1, 8.8.8.8, ya.ru
 ; Сеть, адрес из которой получает VPN-адаптер.
 network = 10.0.0.0/8
 ; Части названия или описания адаптера, по которым узнаётся VPN-клиент.
-continent = Continent, Континент, Код Безопасности, Security Code
+continent = Continent, Континент, Код Безопасности, Security Code, ZTN
 openconnect = OpenConnect, Wintun, TAP-Windows
 
 [rdp]
