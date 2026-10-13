@@ -3,7 +3,9 @@
 
 Каждые несколько секунд параллельно пингуются роутер, интернет, внутренние
 адреса туннеля и RDP-серверы, проверяется, на месте ли адаптер VPN и его
-адрес, Wi-Fi и другой VPN. В журнал пишутся только изменения состояния.
+адрес, Wi-Fi и другой VPN. Раз в полминуты имя VPN-сервера заново
+разрешается через DNS и смотрится, к какому из его адресов подключён клиент.
+В журнал пишутся только изменения состояния.
 Отдельно читается журнал клиента RDP: на каждое отключение RDP выводится
 разбор - что было со связью в последние секунды перед ним.
 """
@@ -24,6 +26,7 @@ FAILS_TO_DOWN = 2     # столько неудач подряд - считае�
 WIFI_EVERY = 10       # секунд между опросами Wi-Fi (netsh)
 RDP_LOG_EVERY = 20    # секунд между чтениями журнала клиента RDP
 RDP_TCP_EVERY = 30    # секунд между проверками порта RDP-серверов
+VPN_EVERY = 30        # секунд между проверками DNS VPN-сервера и адреса подключения
 
 
 def _event_epoch(iso):
@@ -66,6 +69,8 @@ class Monitor:
         self.probes = []
         self.rdp_targets = []
         self.state = {}
+        self.vpn = {}          # имя сервера -> {"ips": [...], "used": [...]}
+        self._vpn_fut = None
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.text_path = os.path.join(logs_dir(), "monitor-%s.log" % stamp)
         self.json_path = os.path.join(logs_dir(), "monitor-%s.jsonl" % stamp)
@@ -168,7 +173,9 @@ class Monitor:
             self.emit("info", "Wi-Fi «%s», точка %s, сигнал %s%%" % (
                 wifi.get("ssid"), wifi.get("bssid"), wifi.get("signal_pct")))
         stats = self._tunnel_stats(snap)
-        last_wifi = last_rdp_log = last_rdp_tcp = time.time()
+        if self.cfg.get("vpn"):
+            self._apply_vpn(self._read_vpn())
+        last_wifi = last_rdp_log = last_rdp_tcp = last_vpn = time.time()
         rdp_seen = set(self._rdp_event_key(e) for e in (winsys.rdp_client_events(10) or []))
         last_tick = time.time()
 
@@ -217,6 +224,17 @@ class Monitor:
             if self.rdp_targets and now - last_rdp_tcp >= RDP_TCP_EVERY:
                 last_rdp_tcp = now
                 self._check_rdp_ports()
+
+            if self._vpn_fut and self._vpn_fut.done():
+                try:
+                    self._apply_vpn(self._vpn_fut.result())
+                except Exception as e:
+                    log.warning("проверка VPN-сервера: %s", e)
+                self._vpn_fut = None
+            if self.cfg.get("vpn") and not self._vpn_fut and now - last_vpn >= VPN_EVERY:
+                last_vpn = now
+                self._vpn_fut = self.pool.submit(self._read_vpn)
+            tick["vpn"] = {n: list(v.get("used") or []) for n, v in self.vpn.items()}
 
             self.history.append(tick)
             while self.history and now - self.history[0]["t"] > HISTORY_SEC:
@@ -311,6 +329,67 @@ class Monitor:
                     self.emit("fail", "порт RDP %s:%d: %s" % (t["host"], t["port"], info))
             t["ok"] = ok
 
+    # ---- VPN-сервер: DNS и адрес подключения ------------------------------
+    def _read_vpn(self):
+        """Адреса имён VPN-серверов из DNS и к каким из них есть подключение."""
+        links = winsys.network_links()
+        res = {}
+        for s in self.cfg.get("vpn", []):
+            ips, info = probes.resolve_all(s["host"])
+            if not ips:
+                res[s["name"]] = {"host": s["host"], "ips": [], "error": info, "used": None}
+                continue
+            used = None
+            if links is not None:
+                sl = winsys.server_links(links, ips, s["port"] if s["proto"] == "tcp" else None)
+                used = []
+                for ip in [c["remote"] for c in sl["tcp"]] + [r["ip"] for r in sl["routes"]]:
+                    if ip not in used:
+                        used.append(ip)
+            res[s["name"]] = {"host": s["host"], "ips": ips, "used": used}
+        return res
+
+    def _apply_vpn(self, res):
+        """Пишет в журнал первые значения и все изменения DNS и адреса подключения."""
+        for name, r in res.items():
+            old = self.vpn.get(name)
+            first = old is None
+            old = old or {}
+            if r.get("error"):
+                if first or old.get("ips"):
+                    self.emit("warn", "%s: DNS - %s: %s" % (name, r["host"], r["error"]),
+                              vpn=name, dns_error=r["error"])
+            elif first:
+                self.emit("info", "%s: DNS %s → %s" % (name, r["host"], ", ".join(r["ips"])),
+                          vpn=name, ips=r["ips"])
+            elif set(r["ips"]) != set(old.get("ips") or []):
+                self.emit("warn", "%s: DNS %s изменился: %s → %s" % (
+                    name, r["host"], ", ".join(old.get("ips") or []) or "нет ответа",
+                    ", ".join(r["ips"])), vpn=name, ips=r["ips"], old_ips=old.get("ips"))
+            used, old_used = r.get("used"), old.get("used")
+            if used is None:          # соединения не прочитать (не Windows / ошибка)
+                r["used"] = old_used
+            elif first:
+                if used:
+                    self.emit("info", "%s: клиент подключён к %s" % (name, ", ".join(used)),
+                              vpn=name, used=used)
+                else:
+                    self.emit("info", "%s: соединений с адресами сервера нет" % name, vpn=name)
+            elif set(used) != set(old_used or []):
+                if used and old_used:
+                    self.emit("warn", "%s: клиент переключился с %s на %s" % (
+                        name, ", ".join(old_used), ", ".join(used)),
+                        vpn=name, used=used, old_used=old_used)
+                elif used:
+                    self.emit("ok", "%s: клиент подключён к %s" % (name, ", ".join(used)),
+                              vpn=name, used=used)
+                else:
+                    self.emit("warn", "%s: соединение с сервером %s пропало" % (
+                        name, ", ".join(old_used)), vpn=name, old_used=old_used)
+            if r.get("error") and old.get("ips"):
+                r["ips"] = old["ips"]  # помним последний ответ, чтобы увидеть смену
+            self.vpn[name] = r
+
     # ---- журнал клиента RDP -----------------------------------------------
     @staticmethod
     def _rdp_event_key(e):
@@ -349,6 +428,10 @@ class Monitor:
         down_kinds = {kinds.get(n) for n in down}
         if not all(t["tunnel"] for t in ticks):
             return "В это время пропадал туннель VPN."
+        vpn_states = {json.dumps(t.get("vpn") or {}, sort_keys=True) for t in ticks}
+        if len(vpn_states) > 1:
+            return "В это время VPN-клиент переподключался к серверу (сменился адрес " \
+                   "подключения)."
         if "gateway" in down_kinds:
             return "В это время не отвечал роутер: проблема в локальной сети или Wi-Fi."
         if len({t.get("wifi") for t in ticks if t.get("wifi")}) > 1:

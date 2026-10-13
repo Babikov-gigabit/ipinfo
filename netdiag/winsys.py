@@ -332,3 +332,62 @@ def rdp_client_events(minutes=60):
         elif e.get("id") == 1024 and props:
             e["server"] = props[0]
     return data
+
+
+# --------------------------------------------------------------------------
+# Активные TCP-соединения и host-маршруты: к какому IP подключён VPN-клиент
+# --------------------------------------------------------------------------
+_PS_LINKS = r"""
+$r = @{}
+$r.tcp = @(Get-NetTCPConnection -State Established | ForEach-Object {
+  @{ remote = [string]$_.RemoteAddress; rport = [int]$_.RemotePort;
+     local = [string]$_.LocalAddress; procid = [int]$_.OwningProcess } })
+$r.procs = @{}
+foreach ($i in ($r.tcp | ForEach-Object { $_.procid } | Sort-Object -Unique)) {
+  $p = Get-Process -Id $i -ErrorAction SilentlyContinue
+  if ($p) { $r.procs[[string]$i] = $p.ProcessName } }
+$r.routes = @(Get-NetRoute -AddressFamily IPv4 | Where-Object { $_.DestinationPrefix -like '*/32' } |
+  ForEach-Object { @{ prefix = [string]$_.DestinationPrefix; ifindex = [int]$_.InterfaceIndex;
+                      nexthop = [string]$_.NextHop } })
+$r | ConvertTo-Json -Depth 4 -Compress
+"""
+
+
+def network_links():
+    """Установленные TCP-соединения (с именем процесса) и маршруты /32. None вне Windows."""
+    if not IS_WINDOWS:
+        return None
+    data = powershell_json(_PS_LINKS)
+    if not isinstance(data, dict):
+        return None
+    procs = data.get("procs") or {}
+    tcp = data.get("tcp") or []
+    if isinstance(tcp, dict):
+        tcp = [tcp]
+    for c in tcp:
+        c["process"] = procs.get(str(c.get("procid")), "")
+    routes = data.get("routes") or []
+    if isinstance(routes, dict):
+        routes = [routes]
+    return {"tcp": tcp, "routes": routes}
+
+
+def server_links(links, ips, port=None):
+    """Какие из адресов сервера реально используются.
+
+    tcp - установленные соединения на эти адреса (и порт, если задан);
+    routes - отдельные маршруты /32 на эти адреса: VPN-клиенты ставят их,
+    чтобы трафик к своему серверу не уходил в туннель (видно и при UDP).
+    """
+    res = {"tcp": [], "routes": []}
+    if not links:
+        return res
+    ipset = set(ips)
+    for c in links.get("tcp", []):
+        if c.get("remote") in ipset and (port is None or c.get("rport") == port):
+            res["tcp"].append(c)
+    for r in links.get("routes", []):
+        ip = (r.get("prefix") or "").split("/")[0]
+        if ip in ipset:
+            res["routes"].append(dict(r, ip=ip))
+    return res

@@ -152,7 +152,8 @@ class DiagnoseTest(unittest.TestCase):
                                   ping.get(ip, PING_OK)), \
                 mock.patch.object(probes, "resolve4", side_effect=lambda h, *a, **k: (h, 0.0)), \
                 mock.patch.object(probes, "find_mtu", return_value=1400), \
-                mock.patch.object(probes, "tcp_connect", return_value=tcp), \
+                mock.patch.object(probes, "tcp_connect", **(
+                    {"side_effect": tcp} if callable(tcp) else {"return_value": tcp})), \
                 mock.patch.object(probes, "external_ip", return_value=ext), \
                 mock.patch.object(ad, "best_interface", side_effect=lambda ip:
                                   (best or {}).get(ip, 9)), \
@@ -294,6 +295,37 @@ class DiagnoseTest(unittest.TestCase):
         self.assertEqual(c["status"], "warn")
         self.assertTrue(c["summary"].startswith("1: соединение потеряно"))
 
+    def test_vpn_server_with_two_ips(self):
+        self.cfg["vpn"] = [{"name": "ztn", "host": "vpng.example.ru", "port": 443,
+                            "proto": "tcp"}]
+        links = {"tcp": [{"remote": "5.5.5.2", "rport": 443, "procid": 7,
+                          "process": "ContinentClient"}], "routes": []}
+        with mock.patch.object(probes, "resolve_all",
+                               return_value=(["5.5.5.1", "5.5.5.2"], 12.0)), \
+                mock.patch.object(winsys, "network_links", return_value=links):
+            d = self.run_diag([self.lan, self.vpn], tcp=lambda ip, port, timeout=5:
+                              (True, 20.0) if ip == "5.5.5.2" else (False, "нет ответа"))
+        names = [c["name"] for c in d["checks"]]
+        self.assertIn("ztn → 5.5.5.1:443/tcp", names)
+        self.assertIn("ztn → 5.5.5.2:443/tcp", names)
+        self.assertEqual(d["vpn_connected"], {"ztn": ["5.5.5.2"]})
+        v = " ".join(d["verdict"])
+        self.assertIn("VPN-клиент подключён к ztn → 5.5.5.2.", v)
+        self.assertIn("У ztn недоступен адрес 5.5.5.1", v)
+        conn = next(c for c in d["checks"] if c["name"] == "ztn: подключение")
+        self.assertIn("ContinentClient", conn["summary"])
+
+    def test_vpn_connection_found_by_host_route(self):
+        self.cfg["vpn"] = [{"name": "ztn", "host": "vpng.example.ru", "port": 443,
+                            "proto": "tcp"}]
+        links = {"tcp": [], "routes": [{"prefix": "5.5.5.1/32", "ifindex": 5,
+                                        "nexthop": "192.168.1.1"}]}
+        with mock.patch.object(probes, "resolve_all",
+                               return_value=(["5.5.5.1", "5.5.5.2"], 12.0)), \
+                mock.patch.object(winsys, "network_links", return_value=links):
+            d = self.run_diag([self.lan, self.vpn])
+        self.assertEqual(d["vpn_connected"], {"ztn": ["5.5.5.1"]})
+
     def test_report_text_and_zip(self):
         d = self.run_diag([self.lan, self.vpn])
         text = report.format_text(d)
@@ -349,6 +381,35 @@ class MonitorTest(unittest.TestCase):
         texts = " ".join(e["text"] for e in self.events)
         self.assertIn("туннель «Continent» пропал", texts)
         self.assertIn("другой VPN: выключен → happ-tun", texts)
+
+    def test_vpn_dns_and_connected_ip_changes(self):
+        self.m.cfg["vpn"] = [{"name": "Континент", "host": "vpn.example", "port": 443,
+                              "proto": "tcp"}]
+        links = {"tcp": [{"remote": "192.0.2.1", "rport": 443, "process": "ztn"}], "routes": []}
+        dns = {"ips": ["192.0.2.1", "192.0.2.2"]}
+        with mock.patch.object(monitor.probes, "resolve_all", lambda h: (dns["ips"], 5.0)), \
+                mock.patch.object(monitor.winsys, "network_links", lambda: links):
+            self.m._apply_vpn(self.m._read_vpn())
+            texts = [e["text"] for e in self.events]
+            self.assertIn("Континент: DNS vpn.example → 192.0.2.1, 192.0.2.2", texts)
+            self.assertIn("Континент: клиент подключён к 192.0.2.1", texts)
+            n = len(self.events)
+            self.m._apply_vpn(self.m._read_vpn())
+            self.assertEqual(len(self.events), n)  # ничего не изменилось - тишина
+            links["tcp"][0]["remote"] = "192.0.2.2"
+            dns["ips"] = ["192.0.2.2"]
+            self.m._apply_vpn(self.m._read_vpn())
+        texts = " ".join(e["text"] for e in self.events[n:])
+        self.assertIn("DNS vpn.example изменился: 192.0.2.1, 192.0.2.2 → 192.0.2.2", texts)
+        self.assertIn("переключился с 192.0.2.1 на 192.0.2.2", texts)
+
+    def test_disconnect_explained_by_vpn_reconnect(self):
+        p = monitor.Probe("internal", "туннель 10.0.0.1", "10.0.0.1")
+        self.m.probes = [p]
+        base = {"probes": {p.name: True}, "tunnel": True, "other_vpn": []}
+        self.m.history.extend([dict(base, t=100, vpn={"К": ["192.0.2.1"]}),
+                               dict(base, t=102, vpn={"К": ["192.0.2.2"]})])
+        self.assertIn("переподключался", self.m.explain_disconnect(103))
 
     def test_wifi_roaming(self):
         self.m._diff_wifi({"bssid": "aa", "signal_pct": 80}, {"bssid": "bb", "signal_pct": 35})

@@ -99,6 +99,28 @@ def _is_virtual(adapter):
     return any(w.lower() in text.lower() for w in VIRTUAL_WORDS)
 
 
+def _vpn_ip_status(r, s):
+    """Статус и описание проверки одного адреса VPN-сервера."""
+    parts, st = [], OK
+    if s["proto"] == "tcp":
+        if r["tcp_ok"]:
+            parts.append("порт открыт за %d мс" % r["tcp"])
+        else:
+            parts.append("порт %d: %s" % (s["port"], r["tcp"]))
+            st = FAIL
+    p = r["ping"]
+    parts.append("ping " + _fmt_ping(p))
+    if p["received"] and p["loss_pct"] >= 25 and st == OK:
+        st = WARN
+    if r.get("mtu"):
+        parts.append("MTU %d" % r["mtu"])
+        if r["mtu"] < 1400 and st == OK:
+            st = WARN
+    if s["proto"] == "udp" and not p["received"]:
+        st = WARN  # UDP-порт проверить нельзя, а ping может быть закрыт
+    return st, parts
+
+
 def _probe_rdp(host, port):
     ip, err = probes.resolve4(host)
     if ip is None:
@@ -146,10 +168,26 @@ def _probe_host(host, count=4, mtu=False):
     return res
 
 
+def _probe_vpn_ip(ip, srv):
+    res = {"ip": ip, "ping": probes.ping(ip, count=4)}
+    if res["ping"]["received"]:
+        res["mtu"] = probes.find_mtu(ip)
+    if srv["proto"] == "tcp":
+        res["tcp_ok"], res["tcp"] = probes.tcp_connect(ip, srv["port"])
+    return res
+
+
 def _probe_vpn_server(srv):
-    res = _probe_host(srv["host"], mtu=True)
-    if res["ip"] and srv["proto"] == "tcp":
-        res["tcp_ok"], res["tcp"] = probes.tcp_connect(res["ip"], srv["port"])
+    """У имени сервера может быть несколько адресов - проверяем каждый отдельно."""
+    ips, dns = probes.resolve_all(srv["host"])
+    res = {"host": srv["host"], "ips": ips, "per_ip": {}}
+    if not ips:
+        res["dns_error"] = dns
+        return res
+    res["dns_ms"] = round(dns, 1) if ips != [srv["host"]] else None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ips)) as ex:
+        futs = {ip: ex.submit(_probe_vpn_ip, ip, srv) for ip in ips}
+        res["per_ip"] = {ip: f.result() for ip, f in futs.items()}
     return res
 
 
@@ -185,6 +223,7 @@ def run(cfg, progress=None):
     f_rdp = pool.submit(winsys.rdp_info) if cfg["rdp"] else None
     f_fw = pool.submit(winsys.firewall_info) if cfg["rdp"] else None
     f_dev = pool.submit(winsys.net_devices)
+    f_links = pool.submit(winsys.network_links)
     f_rdplog = pool.submit(winsys.rdp_client_events, 24 * 60)
 
     # ---- 1. Локальная сеть ------------------------------------------------
@@ -262,39 +301,55 @@ def run(cfg, progress=None):
     vpn_ok, vpn_fail, vpn_via_other = [], [], []
     if not cfg["vpn"]:
         rep.add(G, "Настройки", INFO, "серверы не заданы: добавьте их в раздел [vpn] файла ipinfo.ini")
+    links = f_links.result()
+    vpn_connected, vpn_bad_ips = {}, {}
     for s in cfg["vpn"]:
         r = f_vpn[s["name"]].result()
-        label = "%s (%s:%d/%s)" % (s["name"], s["host"], s["port"], s["proto"])
-        if r["ip"] is None:
+        if not r["ips"]:
             vpn_fail.append(s["name"])
-            rep.add(G, label, FAIL, r["dns_error"], **r)
+            rep.add(G, "%s (%s)" % (s["name"], s["host"]), FAIL, r["dns_error"], **r)
             continue
-        parts, st = [], OK
-        if s["proto"] == "tcp":
-            if r["tcp_ok"]:
-                parts.append("порт открыт за %d мс" % r["tcp"])
+        if r.get("dns_ms") is not None:
+            rep.add(G, "%s: DNS" % s["name"], OK, "%s → %s (%d мс)" % (
+                s["host"], ", ".join(r["ips"]), r["dns_ms"]), ips=r["ips"])
+        good = []
+        for ip in r["ips"]:
+            st, parts = _vpn_ip_status(r["per_ip"][ip], s)
+            other = via_other(ip)
+            if other:
+                vpn_via_other.append("%s через «%s»" % (s["name"], other["name"]))
+                parts.append("подключение идёт через «%s»: на ping и порт может отвечать сам "
+                             "этот VPN" % other["name"])
+                if st == OK:
+                    st = WARN
+            if st != FAIL:
+                good.append(ip)
             else:
-                parts.append("порт %d: %s" % (s["port"], r["tcp"]))
-                st = FAIL
-        p = r["ping"]
-        parts.append("ping " + _fmt_ping(p))
-        if p["received"] and p["loss_pct"] >= 25 and st == OK:
-            st = WARN
-        if r.get("mtu"):
-            parts.append("MTU %d" % r["mtu"])
-            if r["mtu"] < 1400 and st == OK:
-                st = WARN
-        if s["proto"] == "udp" and not p["received"]:
-            st = WARN  # UDP-порт проверить нельзя, а ping может быть закрыт
-        other = via_other(r["ip"])
-        if other:
-            vpn_via_other.append("%s через «%s»" % (s["name"], other["name"]))
-            parts.append("подключение идёт через «%s»: на ping и порт может отвечать сам этот "
-                         "VPN" % other["name"])
-            if st == OK:
-                st = WARN
-        (vpn_ok if st != FAIL else vpn_fail).append(s["name"])
-        rep.add(G, label, st, ", ".join(parts), **r)
+                vpn_bad_ips.setdefault(s["name"], []).append(ip)
+            rep.add(G, "%s → %s:%d/%s" % (s["name"], ip, s["port"], s["proto"]), st,
+                    ", ".join(parts), **r["per_ip"][ip])
+        (vpn_ok if good else vpn_fail).append(s["name"])
+
+        # К какому из адресов реально подключён клиент
+        sl = winsys.server_links(links, r["ips"], s["port"] if s["proto"] == "tcp" else None)
+        used = []
+        for c in sl["tcp"]:
+            if c["remote"] not in used:
+                used.append(c["remote"])
+        how = "TCP-соединение" + (" процесса %s" % sl["tcp"][0]["process"]
+                                  if sl["tcp"] and sl["tcp"][0].get("process") else "")
+        if not used:
+            used = [rt["ip"] for rt in sl["routes"]]
+            how = "отдельный маршрут к серверу"
+        if used:
+            vpn_connected[s["name"]] = used
+            bad = set(used) & set(vpn_bad_ips.get(s["name"], []))
+            rep.add(G, "%s: подключение" % s["name"], WARN if bad else OK,
+                    "клиент подключён к %s (%s)" % (", ".join(used), how), links=sl)
+        elif links is not None and tunnels:
+            rep.add(G, "%s: подключение" % s["name"], INFO,
+                    "соединений с адресами %s не найдено: клиент подключён к другому "
+                    "серверу или по UDP" % ", ".join(r["ips"]))
 
     # ---- 4. Туннель ---------------------------------------------------------
     G = "Туннель"
@@ -416,6 +471,9 @@ def run(cfg, progress=None):
         "net_devices": devices,
         "other_vpn": [a["name"] for a in other_vpn],
         "vpn_via_other": vpn_via_other,
+        "vpn_connected": vpn_connected,
+        "vpn_bad_ips": vpn_bad_ips,
+        "network_links": links,
         "rdp_out": {"ok": rdp_out_ok, "fail": rdp_out_fail},
         "firewall": fw,
         "checks": rep.checks,
@@ -576,6 +634,17 @@ def verdict(data, physical, gw_ok, inet_ok, dns_fail, vpn_ok, vpn_fail, tunnels,
         v.append("Подключение к VPN-серверу идёт через другой VPN (%s): проверка сервера "
                  "не показательна, а обрыв того VPN может оборвать и корпоративный."
                  % ", ".join(data["vpn_via_other"]))
+
+    for name, ips in (data.get("vpn_connected") or {}).items():
+        line = "VPN-клиент подключён к %s → %s." % (name, ", ".join(ips))
+        bad = set(ips) & set((data.get("vpn_bad_ips") or {}).get(name, []))
+        if bad:
+            line += " Этот адрес сейчас не проходит проверку: %s." % ", ".join(sorted(bad))
+        v.append(line)
+    for name, bad in (data.get("vpn_bad_ips") or {}).items():
+        if name in vpn_ok:
+            v.append("У %s недоступен адрес %s: при переподключении на него клиент "
+                     "не подключится." % (name, ", ".join(bad)))
 
     if vpn_fail and inet_ok:
         if vpn_ok:

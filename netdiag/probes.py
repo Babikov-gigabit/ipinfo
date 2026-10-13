@@ -217,3 +217,35 @@ def external_ip(timeout=4):
             reason = getattr(e, "reason", None) or e
             errors.append("%s: %s" % (url, reason))
     return None, "; ".join(errors)
+
+
+def resolve_all(host, timeout=5):
+    """Все IPv4-адреса имени (у сервера может быть несколько A-записей).
+
+    Возвращает (список адресов, мс) или ([], текст ошибки).
+    """
+    try:
+        socket.inet_aton(host)
+        if host.count(".") == 3:
+            return [host], 0.0
+    except OSError:
+        pass
+    t0 = time.perf_counter()
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(socket.getaddrinfo, host, None, socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        info = fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        return [], "DNS не ответил за %d с" % timeout
+    except socket.gaierror as e:
+        return [], "имя не разрешается (%s)" % (e.strerror or e)
+    except Exception as e:
+        return [], str(e)
+    finally:
+        ex.shutdown(wait=False)
+    ips = []
+    for item in info:
+        ip = item[4][0]
+        if ip not in ips:
+            ips.append(ip)
+    return ips, (time.perf_counter() - t0) * 1000
