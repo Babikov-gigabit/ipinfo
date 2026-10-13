@@ -1,289 +1,51 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ipinfo - показывает IP-адреса всех сетевых адаптеров.
+ipinfo - сетевые адаптеры и диагностика VPN (Континент, OpenConnect).
 
 Только стандартная библиотека Python (ctypes / tkinter / urllib).
 
 Запуск:
-    python ipinfo.py            # окно
-    python ipinfo.py --cli      # консоль
-    python ipinfo.py --all      # включая выключенные адаптеры и loopback
-    python ipinfo.py --no-net   # не запрашивать внешний IP
-    python ipinfo.py --json     # вывод в JSON
+    python ipinfo.py              # окно
+    python ipinfo.py --cli        # адаптеры в консоль
+    python ipinfo.py --check      # полная проверка сети и VPN в консоль
+    python ipinfo.py --report     # проверка + zip-отчёт для отправки
+    python ipinfo.py --all        # включая выключенные адаптеры и loopback
+    python ipinfo.py --no-net     # не запрашивать внешний IP
+    python ipinfo.py --json       # вывод в JSON (адаптеры, с --check - вся проверка)
+    python ipinfo.py --config F   # другой файл настроек вместо ipinfo.ini
 """
 
 import argparse
 import json
-import os
-import platform
-import re
-import socket
-import subprocess
+import queue
 import sys
+import threading
+import traceback
 
-IS_WINDOWS = platform.system() == "Windows"
+from netdiag import __version__, adapters as ad, config, diagnose, probes, report
+from netdiag.sysutil import attach_console, resource_path
 
 ICON_NAME = "ip-icon.ico"
-
-
-def resource_path(name):
-    """Путь к ресурсу рядом со скриптом или внутри собранного exe."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, name)
-
-
-# --------------------------------------------------------------------------
-# Windows: GetAdaptersAddresses через ctypes.
-# Не зависит от языка системы (в отличие от разбора вывода ipconfig).
-# --------------------------------------------------------------------------
-def _adapters_windows():
-    import ctypes
-    from ctypes import wintypes
-
-    wsz = ctypes.c_wchar_p
-    ULONG = wintypes.ULONG
-    ULONG64 = ctypes.c_uint64
-
-    class SOCKADDR(ctypes.Structure):
-        _fields_ = [("sa_family", ctypes.c_ushort), ("sa_data", ctypes.c_ubyte * 26)]
-
-    class SOCKET_ADDRESS(ctypes.Structure):
-        _fields_ = [("lpSockaddr", ctypes.POINTER(SOCKADDR)),
-                    ("iSockaddrLength", ctypes.c_int)]
-
-    class IP_ADAPTER_UNICAST_ADDRESS(ctypes.Structure):
-        pass
-
-    IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
-        ("Length", ULONG), ("Flags", wintypes.DWORD),
-        ("Next", ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
-        ("Address", SOCKET_ADDRESS),
-        ("PrefixOrigin", ctypes.c_int), ("SuffixOrigin", ctypes.c_int),
-        ("DadState", ctypes.c_int),
-        ("ValidLifetime", ULONG), ("PreferredLifetime", ULONG),
-        ("LeaseLifetime", ULONG), ("OnLinkPrefixLength", ctypes.c_ubyte),
-    ]
-
-    class IP_ADAPTER_ADDR(ctypes.Structure):
-        """Общая форма для DNS / Gateway / Anycast / Multicast / WINS."""
-        pass
-
-    IP_ADAPTER_ADDR._fields_ = [
-        ("Length", ULONG), ("Reserved", wintypes.DWORD),
-        ("Next", ctypes.POINTER(IP_ADAPTER_ADDR)),
-        ("Address", SOCKET_ADDRESS),
-    ]
-
-    class IP_ADAPTER_ADDRESSES(ctypes.Structure):
-        pass
-
-    IP_ADAPTER_ADDRESSES._fields_ = [
-        ("Length", ULONG), ("IfIndex", ULONG),
-        ("Next", ctypes.POINTER(IP_ADAPTER_ADDRESSES)),
-        ("AdapterName", ctypes.c_char_p),
-        ("FirstUnicastAddress", ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
-        ("FirstAnycastAddress", ctypes.POINTER(IP_ADAPTER_ADDR)),
-        ("FirstMulticastAddress", ctypes.POINTER(IP_ADAPTER_ADDR)),
-        ("FirstDnsServerAddress", ctypes.POINTER(IP_ADAPTER_ADDR)),
-        ("DnsSuffix", wsz), ("Description", wsz), ("FriendlyName", wsz),
-        ("PhysicalAddress", ctypes.c_ubyte * 8), ("PhysicalAddressLength", ULONG),
-        ("Flags", ULONG), ("Mtu", ULONG), ("IfType", ULONG), ("OperStatus", ctypes.c_int),
-        ("Ipv6IfIndex", ULONG), ("ZoneIndices", ULONG * 16),
-        ("FirstPrefix", ctypes.c_void_p),
-        ("TransmitLinkSpeed", ULONG64), ("ReceiveLinkSpeed", ULONG64),
-        ("FirstWinsServerAddress", ctypes.POINTER(IP_ADAPTER_ADDR)),
-        ("FirstGatewayAddress", ctypes.POINTER(IP_ADAPTER_ADDR)),
-        ("Ipv4Metric", ULONG), ("Ipv6Metric", ULONG),
-    ]
-
-    def sockaddr_to_ip(sa_ptr):
-        if not sa_ptr:
-            return None
-        sa = sa_ptr.contents
-        raw = bytes(bytearray(sa.sa_data))
-        if sa.sa_family == socket.AF_INET:          # sin_addr на смещении 4
-            return socket.inet_ntop(socket.AF_INET, raw[2:6])
-        if sa.sa_family == socket.AF_INET6:         # sin6_addr на смещении 8
-            return socket.inet_ntop(socket.AF_INET6, raw[6:22])
-        return None
-
-    def walk(ptr):
-        while ptr:
-            node = ptr.contents
-            yield node
-            ptr = node.Next
-
-    GAA_FLAG_SKIP_ANYCAST = 0x0002
-    GAA_FLAG_SKIP_MULTICAST = 0x0004
-    GAA_FLAG_INCLUDE_GATEWAYS = 0x0080
-    flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_INCLUDE_GATEWAYS
-
-    GetAdaptersAddresses = ctypes.windll.iphlpapi.GetAdaptersAddresses
-    size = ULONG(15 * 1024)
-    buf = None
-    for _ in range(4):
-        buf = ctypes.create_string_buffer(size.value)
-        rc = GetAdaptersAddresses(0, flags, None,
-                                  ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_ADDRESSES)),
-                                  ctypes.byref(size))
-        if rc == 0:
-            break
-        if rc != 111:  # ERROR_BUFFER_OVERFLOW
-            raise OSError("GetAdaptersAddresses failed, code %d" % rc)
-    else:
-        raise OSError("GetAdaptersAddresses: не удалось выделить буфер")
-
-    OPER = {1: "Up", 2: "Down", 3: "Testing", 4: "Unknown",
-            5: "Dormant", 6: "NotPresent", 7: "LowerLayerDown"}
-    IFTYPE = {6: "Ethernet", 23: "PPP", 24: "Loopback", 53: "Виртуальный",
-              71: "Wi-Fi", 131: "Tunnel", 144: "IEEE1394", 237: "IEEE1394"}
-
-    result = []
-    for a in walk(ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_ADDRESSES))):
-        ipv4, ipv6 = [], []
-        for u in walk(a.FirstUnicastAddress):
-            ip = sockaddr_to_ip(u.Address.lpSockaddr)
-            if not ip:
-                continue
-            entry = "%s/%d" % (ip, u.OnLinkPrefixLength)
-            (ipv6 if ":" in ip else ipv4).append(entry)
-
-        gws = [ip for ip in (sockaddr_to_ip(g.Address.lpSockaddr)
-                             for g in walk(a.FirstGatewayAddress)) if ip]
-        dns = [ip for ip in (sockaddr_to_ip(d.Address.lpSockaddr)
-                             for d in walk(a.FirstDnsServerAddress)) if ip]
-
-        mac = ":".join("%02X" % b for b in a.PhysicalAddress[:a.PhysicalAddressLength])
-        speed = a.TransmitLinkSpeed
-        if speed in (0, 0xFFFFFFFFFFFFFFFF):
-            speed_s = "-"
-        elif speed >= 10 ** 9:
-            speed_s = "%.0f Gbps" % (speed / 10 ** 9)
-        else:
-            speed_s = "%.0f Mbps" % (speed / 10 ** 6)
-
-        result.append({
-            "name": a.FriendlyName or "",
-            "description": a.Description or "",
-            "type": IFTYPE.get(a.IfType, "type %d" % a.IfType),
-            "status": OPER.get(a.OperStatus, "?"),
-            "up": a.OperStatus == 1,
-            "ipv4": ipv4, "ipv6": ipv6,
-            "gateway": gws, "dns": dns,
-            "mac": mac or "-",
-            "mtu": a.Mtu if a.Mtu < 0xFFFFFFFF else 0,
-            "speed": speed_s,
-            "loopback": a.IfType == 24,
-        })
-    return result
-
-
-# --------------------------------------------------------------------------
-# Linux / macOS: разбор вывода ip / ifconfig (вывод не локализуется).
-# --------------------------------------------------------------------------
-def _run(cmd):
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
-    except Exception:
-        return ""
-
-
-def _adapters_posix():
-    ifaces = {}
-
-    def get(name):
-        return ifaces.setdefault(name, {
-            "name": name, "description": "", "type": "-", "status": "Unknown",
-            "up": False, "ipv4": [], "ipv6": [], "gateway": [], "dns": [],
-            "mac": "-", "mtu": 0, "speed": "-",
-            "loopback": name in ("lo", "lo0"),
-        })
-
-    out = _run(["ip", "-o", "addr", "show"])
-    if out:
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) < 4:
-                continue
-            it = get(parts[1])
-            fam, addr = parts[2], parts[3]
-            if fam == "inet":
-                it["ipv4"].append(addr)
-            elif fam == "inet6":
-                it["ipv6"].append(addr)
-        for line in _run(["ip", "-o", "link", "show"]).splitlines():
-            m = re.match(r"\d+:\s+([^:@]+)[:@].*?<([^>]*)>.*?mtu (\d+)", line)
-            if not m:
-                continue
-            it = get(m.group(1))
-            it["up"] = "UP" in m.group(2).split(",")
-            it["status"] = "Up" if it["up"] else "Down"
-            it["mtu"] = int(m.group(3))
-            mac = re.search(r"link/\w+\s+([0-9a-f:]{17})", line)
-            if mac:
-                it["mac"] = mac.group(1).upper()
-        for line in _run(["ip", "route", "show", "default"]).splitlines():
-            m = re.search(r"default via (\S+) dev (\S+)", line)
-            if m:
-                get(m.group(2))["gateway"].append(m.group(1))
-    else:
-        # macOS / системы без iproute2
-        cur = None
-        for line in _run(["ifconfig", "-a"]).splitlines():
-            m = re.match(r"^(\S+):\s+flags=\d+<([^>]*)>.*mtu (\d+)", line)
-            if m:
-                cur = get(m.group(1))
-                cur["up"] = "UP" in m.group(2).split(",")
-                cur["status"] = "Up" if cur["up"] else "Down"
-                cur["mtu"] = int(m.group(3))
-                continue
-            if cur is None:
-                continue
-            s = line.strip()
-            if s.startswith("inet "):
-                cur["ipv4"].append(s.split()[1])
-            elif s.startswith("inet6 "):
-                cur["ipv6"].append(s.split()[1].split("%")[0])
-            elif s.startswith("ether "):
-                cur["mac"] = s.split()[1].upper()
-        for line in _run(["netstat", "-rn"]).splitlines():
-            p = line.split()
-            if len(p) >= 4 and p[0] in ("default", "0.0.0.0") and p[-1] in ifaces:
-                ifaces[p[-1]]["gateway"].append(p[1])
-
-    try:
-        with open("/etc/resolv.conf") as f:
-            servers = [ln.split()[1] for ln in f if ln.startswith("nameserver")]
-        for it in ifaces.values():
-            if it["up"]:
-                it["dns"] = servers
-    except Exception:
-        pass
-
-    return list(ifaces.values())
+log = report.log
 
 
 def get_adapters(include_down=False):
-    data = _adapters_windows() if IS_WINDOWS else _adapters_posix()
-    data.sort(key=lambda x: (not x["up"], x["name"]))
+    """Адаптеры для окна и --cli.
+
+    Без --all показываются активные адаптеры с IP, а также отключённые
+    Ethernet и Wi-Fi: «кабель не подключён» - тоже важная информация.
+    """
+    data = ad.get_adapters(include_down=True)
     if include_down:
         return data
-    return [a for a in data
-            if a["up"] and not a.get("loopback") and (a["ipv4"] or a["ipv6"])]
+    return [a for a in data if not a.get("loopback") and (
+        (a["up"] and (a["ipv4"] or a["ipv6"])) or (not a["up"] and a.get("iftype") in (6, 71)))]
 
 
-def get_external_ip(timeout=4):
-    import urllib.request
-    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
-        try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
-                ip = r.read().decode("utf-8", "ignore").strip()
-            if ip:
-                return ip
-        except Exception:
-            continue
-    return "нет связи"
+def get_external_ip():
+    ip, _err = probes.external_ip()
+    return ip or "нет связи"
 
 
 # --------------------------------------------------------------------------
@@ -303,6 +65,8 @@ def print_console(adapters, external=None):
         if a["description"] and a["description"] != a["name"]:
             print("    %s" % a["description"])
         print("    IPv4    : %s" % (", ".join(a["ipv4"]) or "-"))
+        if any(ad.is_apipa(ip) for ip in ad.ipv4_addrs(a)):
+            print("    !!      : адрес 169.254.x.x - DHCP не выдал адрес")
         if a["ipv6"]:
             print("    IPv6    : %s" % ", ".join(a["ipv6"]))
         print("    Шлюз    : %s" % (", ".join(a["gateway"]) or "-"))
@@ -315,6 +79,27 @@ def print_console(adapters, external=None):
     print()
 
 
+def console_check(args, cfg):
+    def progress(c):
+        if not args.json:
+            print("  " + report.format_check(c), flush=True)
+
+    if not args.json:
+        print("Проверка сети... (настройки: %s)" % (cfg["path"] or "по умолчанию"), flush=True)
+    data = diagnose.run(cfg, progress=progress)
+    report.save_check(data)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+    else:
+        print()
+        print("ИТОГ")
+        for v in data["verdict"]:
+            print("  * " + v)
+    if args.report:
+        path = report.build_zip(data, cfg)
+        print("\nОтчёт сохранён: %s" % path)
+
+
 # --------------------------------------------------------------------------
 # GUI - минималистичный список карточек
 # --------------------------------------------------------------------------
@@ -325,22 +110,32 @@ FG_MUTED = "#a1a1aa"    # подписи
 RULE = "#ececee"        # разделители
 DOT_UP = "#22c55e"      # индикатор активного адаптера
 DOT_DOWN = "#d4d4d8"
+FG_WARN = "#d97706"
+FG_FAIL = "#dc2626"
+FG_OK = "#16a34a"
+STATUS_COLOR = {"ok": FG_OK, "warn": FG_WARN, "fail": FG_FAIL, "info": FG_MUTED}
 
 
-def run_gui(include_down, want_external):
-    import threading
+def run_gui(include_down, want_external, cfg_path=None):
     import tkinter as tk
-    from tkinter import font as tkfont
+    from tkinter import font as tkfont, messagebox
 
     root = tk.Tk()
     root.title("IP")
     root.configure(bg=BG)
-    root.geometry("400x480")
+    root.geometry("400x520")
     root.minsize(340, 300)
     try:
         root.iconbitmap(resource_path(ICON_NAME))
     except Exception:
         pass
+
+    def on_error(exc, val, tb):
+        log.error("ошибка в окне: %s", "".join(traceback.format_exception(exc, val, tb)))
+        messagebox.showerror("IPInfo", "Ошибка: %s\n\nПодробности в журнале:\n%s"
+                             % (val, report.logs_dir()))
+
+    root.report_callback_exception = on_error
 
     family = "Segoe UI" if "Segoe UI" in tkfont.families() else "Helvetica"
     f_label = (family, 8)
@@ -348,7 +143,29 @@ def run_gui(include_down, want_external):
     f_meta = (family, 8)
     f_head = (family, 9)
 
-    state = {"toast": None}
+    # Фоновые потоки не трогают tkinter: они кладут функции в очередь,
+    # а главный поток выполняет их по таймеру.
+    ui_queue = queue.Queue()
+
+    def pump():
+        try:
+            while True:
+                ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
+        root.after(100, pump)
+
+    def in_background(work, done):
+        def runner():
+            try:
+                res = work()
+            except Exception as e:
+                log.exception("ошибка в фоновой задаче")
+                res = e
+            ui_queue.put(lambda: done(res))
+        threading.Thread(target=runner, daemon=True).start()
+
+    state = {"toast": None, "gen": 0}
 
     # --- шапка ---------------------------------------------------------
     head = tk.Frame(root, bg=BG)
@@ -356,12 +173,18 @@ def run_gui(include_down, want_external):
 
     tk.Label(head, text="СЕТЬ", font=(family, 8, "bold"), fg=FG_MUTED, bg=BG).pack(side="left")
 
-    reload_btn = tk.Label(head, text="↻", font=(family, 13), fg=FG_MUTED, bg=BG, cursor="hand2")
-    reload_btn.pack(side="right")
+    def head_button(text, size=8):
+        b = tk.Label(head, text=text, font=(family, size), fg=FG_MUTED, bg=BG, cursor="hand2")
+        b.pack(side="right", padx=(10, 0))
+        b.bind("<Enter>", lambda _e: b.config(fg=FG))
+        b.bind("<Leave>", lambda _e: b.config(fg=FG_MUTED))
+        return b
+
+    reload_btn = head_button("↻", 13)
+    check_btn = head_button("ПРОВЕРКА")
 
     # --- прокручиваемая область ----------------------------------------
     canvas = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0)
-    canvas.pack(fill="both", expand=True)
     body = tk.Frame(canvas, bg=BG)
     win = canvas.create_window((0, 0), window=body, anchor="nw")
 
@@ -377,11 +200,13 @@ def run_gui(include_down, want_external):
     def on_wheel(e):
         canvas.yview_scroll(-1 * (e.delta // 120), "units")
 
-    root.bind_all("<MouseWheel>", on_wheel)
+    canvas.bind("<MouseWheel>", on_wheel)
+    body.bind("<MouseWheel>", on_wheel)
 
     # --- подвал --------------------------------------------------------
     foot = tk.Frame(root, bg=BG)
     foot.pack(fill="x", side="bottom")
+    canvas.pack(fill="both", expand=True)
     tk.Frame(foot, bg=RULE, height=1).pack(fill="x")
     foot_row = tk.Frame(foot, bg=BG)
     foot_row.pack(fill="x", padx=22, pady=12)
@@ -397,6 +222,8 @@ def run_gui(include_down, want_external):
         state["toast"] = root.after(1400, lambda: hint.config(text="клик — копировать", fg=FG_MUTED))
 
     # --- карточка адаптера ---------------------------------------------
+    cfg_for_cards = config.load(cfg_path)
+
     def add_card(a, first):
         if not first:
             tk.Frame(body, bg=RULE, height=1).pack(fill="x", padx=22)
@@ -408,45 +235,82 @@ def run_gui(include_down, want_external):
 
         top = tk.Frame(inner, bg=BG)
         top.pack(fill="x")
-        tk.Label(top, text=a["name"].upper(), font=f_label, fg=FG_MUTED, bg=BG,
+        title = a["name"].upper()
+        tunnels, _l, _i, _c = diagnose.classify([a], cfg_for_cards)
+        if tunnels:
+            title += "  ·  VPN " + tunnels[0]["client"].upper()
+        tk.Label(top, text=title, font=f_label, fg=FG_MUTED, bg=BG,
                  anchor="w").pack(side="left")
         tk.Label(top, text="●", font=(family, 7), bg=BG,
                  fg=DOT_UP if a["up"] else DOT_DOWN).pack(side="right")
 
         ip = a["ipv4"][0].split("/")[0] if a["ipv4"] else (
             a["ipv6"][0].split("/")[0] if a["ipv6"] else "—")
-        tk.Label(inner, text=ip, font=f_ip, fg=FG, bg=BG, anchor="w").pack(fill="x", pady=(1, 2))
+        if not a["up"]:
+            ip_text, ip_fg = "не подключён", FG_MUTED
+        elif ad.is_apipa(ip):
+            ip_text, ip_fg = ip, FG_FAIL
+        else:
+            ip_text, ip_fg = ip, FG
+        tk.Label(inner, text=ip_text, font=f_ip, fg=ip_fg, bg=BG, anchor="w").pack(
+            fill="x", pady=(1, 2))
 
         bits = []
         if a["ipv4"] and "/" in a["ipv4"][0]:
-            bits.append("/" + a["ipv4"][0].split("/")[1])
+            bits.append(ad.prefix_to_mask(a["ipv4"][0].split("/")[1]))
         if a["gateway"]:
             bits.append("шлюз " + a["gateway"][0])
-        tk.Label(inner, text="   ·   ".join(bits), font=f_meta, fg=FG_MUTED, bg=BG,
-                 anchor="w").pack(fill="x")
+        if ad.is_apipa(ip):
+            bits = ["DHCP не выдал адрес"]
+        if bits:
+            tk.Label(inner, text="   ·   ".join(bits), font=f_meta, fg=FG_MUTED, bg=BG,
+                     anchor="w").pack(fill="x")
+        meta = []
+        if a["dns"]:
+            meta.append("DNS " + ", ".join(a["dns"][:2]))
+        if a["up"]:
+            meta.append("MTU %s" % a["mtu"])
+            if a["speed"] != "-":
+                meta.append(a["speed"])
+        if meta:
+            tk.Label(inner, text="   ·   ".join(meta), font=f_meta, fg=FG_MUTED, bg=BG,
+                     anchor="w").pack(fill="x")
+
+        widgets = (card, inner, top) + tuple(inner.winfo_children()) + tuple(top.winfo_children())
 
         def paint(color):
-            for w in (card, inner, top) + tuple(inner.winfo_children()) + tuple(top.winfo_children()):
+            for w in widgets:
                 try:
                     w.configure(bg=color)
                 except tk.TclError:
                     pass
 
         def copy(_e=None):
+            if ip == "—" or not a["up"]:
+                return
             root.clipboard_clear()
             root.clipboard_append(ip)
             toast("скопировано  " + ip)
 
-        for w in (card, inner, top) + tuple(inner.winfo_children()) + tuple(top.winfo_children()):
+        for w in widgets:
             w.bind("<Button-1>", copy)
             w.bind("<Enter>", lambda _e: paint(BG_HOVER))
             w.bind("<Leave>", lambda _e: paint(BG))
+            w.bind("<MouseWheel>", on_wheel)
 
     # --- обновление ----------------------------------------------------
     def refresh(_e=None):
+        state["gen"] += 1
+        gen = state["gen"]
         for w in body.winfo_children():
             w.destroy()
-        adapters = get_adapters(include_down=include_down)
+        try:
+            adapters = get_adapters(include_down=include_down)
+        except Exception as e:
+            log.exception("не удалось получить список адаптеров")
+            adapters = []
+            tk.Label(body, text="ошибка: %s" % e, font=f_head, fg=FG_FAIL, bg=BG,
+                     wraplength=320).pack(pady=40)
         if not adapters:
             tk.Label(body, text="адаптеров с IP нет", font=f_head, fg=FG_MUTED,
                      bg=BG).pack(pady=40)
@@ -457,31 +321,179 @@ def run_gui(include_down, want_external):
         if want_external:
             ext_label.config(text="внешний  …")
 
-            def fetch():
-                ip = get_external_ip()
-                root.after(0, lambda: ext_label.config(text="внешний  " + ip))
+            def show(ip):
+                if gen == state["gen"]:  # не перезаписывать более свежий ответ
+                    ext_label.config(text="внешний  " + (ip if isinstance(ip, str) else "?"))
 
-            threading.Thread(target=fetch, daemon=True).start()
+            in_background(get_external_ip, show)
         else:
             ext_label.config(text="")
 
+    # --- окно проверки -------------------------------------------------
+    def open_check(_e=None):
+        if state.get("check_win") and state["check_win"].winfo_exists():
+            state["check_win"].lift()
+            return
+        cfg_file = cfg_path or config.ensure_config()
+        cfg = config.load(cfg_file)
+
+        w = tk.Toplevel(root)
+        state["check_win"] = w
+        w.title("Проверка сети")
+        w.configure(bg=BG)
+        w.geometry("640x560")
+        try:
+            w.iconbitmap(resource_path(ICON_NAME))
+        except Exception:
+            pass
+
+        bar = tk.Frame(w, bg=BG)
+        bar.pack(fill="x", padx=16, pady=(12, 6))
+        status = tk.Label(bar, text="проверка…", font=f_head, fg=FG_MUTED, bg=BG)
+        status.pack(side="left")
+
+        def link(text, cmd):
+            b = tk.Label(bar, text=text, font=f_meta, fg=FG_MUTED, bg=BG, cursor="hand2")
+            b.pack(side="right", padx=(12, 0))
+            b.bind("<Button-1>", cmd)
+            b.bind("<Enter>", lambda _e: b.config(fg=FG))
+            b.bind("<Leave>", lambda _e: b.config(fg=FG_MUTED))
+            return b
+
+        txt = tk.Text(w, font=(family, 9), bg=BG, fg=FG, relief="flat", wrap="word",
+                      padx=16, pady=8, highlightthickness=0)
+        sb = tk.Scrollbar(w, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        for k, color in STATUS_COLOR.items():
+            txt.tag_configure(k, foreground=color)
+        txt.tag_configure("group", font=(family, 8, "bold"), foreground=FG_MUTED,
+                          spacing1=10)
+        txt.tag_configure("verdict", font=(family, 10, "bold"), spacing1=4)
+        txt.tag_configure("muted", foreground=FG_MUTED)
+
+        run_state = {"group": None, "data": None, "busy": False}
+
+        def put(text, *tags):
+            txt.configure(state="normal")
+            txt.insert("end", text, tags)
+            txt.see("end")
+            txt.configure(state="disabled")
+
+        def on_progress(c):
+            def show():
+                if c["group"] != run_state["group"]:
+                    run_state["group"] = c["group"]
+                    put(c["group"].upper() + "\n", "group")
+                put("  ● ", c["status"])
+                put("%s: " % c["name"])
+                put(c["summary"] + "\n", *(("muted",) if c["status"] == "info" else ()))
+            ui_queue.put(show)
+
+        def finished(data):
+            run_state["busy"] = False
+            if isinstance(data, Exception):
+                status.config(text="ошибка проверки", fg=FG_FAIL)
+                put("\nОшибка: %s\nПодробности в журнале: %s\n" % (data, report.logs_dir()),
+                    "fail")
+                return
+            run_state["data"] = data
+            report.save_check(data)
+            bad = any(c["status"] == "fail" for c in data["checks"])
+            status.config(text="есть проблемы" if bad else "проблем не найдено",
+                          fg=FG_FAIL if bad else FG_OK)
+            put("\nИТОГ\n", "group")
+            for v in data["verdict"]:
+                put(v + "\n", "verdict")
+            put("\nПроверка заняла %s с. Настройки: %s\n" % (
+                data["duration_sec"], cfg["path"] or "по умолчанию"), "muted")
+
+        def start(_e=None):
+            if run_state["busy"]:
+                return
+            run_state.update(busy=True, group=None, data=None)
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.configure(state="disabled")
+            status.config(text="проверка…", fg=FG_MUTED)
+            in_background(lambda: diagnose.run(cfg, progress=on_progress), finished)
+
+        def save_report(_e=None):
+            if run_state["busy"]:
+                toast("дождитесь окончания проверки")
+                return
+            if not run_state["data"]:
+                return
+            status.config(text="собираю отчёт…", fg=FG_MUTED)
+
+            def done(path):
+                if isinstance(path, Exception):
+                    status.config(text="отчёт не собран: %s" % path, fg=FG_FAIL)
+                    return
+                status.config(text="отчёт сохранён", fg=FG_OK)
+                put("\nОтчёт: %s\n" % path, "verdict")
+                _show_in_explorer(path)
+
+            in_background(lambda: report.build_zip(run_state["data"], cfg), done)
+
+        def open_config(_e=None):
+            _open_file(cfg_file)
+
+        link("настройки", open_config)
+        link("сохранить отчёт", save_report)
+        link("повторить", start)
+        w.bind("<Escape>", lambda _e: w.destroy())
+        start()
+
     reload_btn.bind("<Button-1>", refresh)
-    reload_btn.bind("<Enter>", lambda _e: reload_btn.config(fg=FG))
-    reload_btn.bind("<Leave>", lambda _e: reload_btn.config(fg=FG_MUTED))
+    check_btn.bind("<Button-1>", open_check)
     root.bind("<F5>", refresh)
     root.bind("<Escape>", lambda _e: root.destroy())
 
+    pump()
     refresh()
     root.mainloop()
 
 
+def _show_in_explorer(path):
+    import os
+    import subprocess
+    try:
+        if os.name == "nt":
+            subprocess.Popen(["explorer", "/select,", path])
+    except Exception:
+        pass
+
+
+def _open_file(path):
+    import os
+    try:
+        if os.name == "nt":
+            os.startfile(path)  # откроется в Блокноте или редакторе по умолчанию
+    except Exception as e:
+        log.warning("не удалось открыть %s: %s", path, e)
+
+
 def main():
-    p = argparse.ArgumentParser(description="Показывает IP всех сетевых адаптеров")
+    p = argparse.ArgumentParser(description="IPInfo %s: сетевые адаптеры и диагностика VPN"
+                                % __version__)
     p.add_argument("--cli", action="store_true", help="консольный вывод вместо окна")
+    p.add_argument("--check", action="store_true", help="полная проверка сети и VPN")
+    p.add_argument("--report", action="store_true", help="проверка и zip-отчёт для отправки")
     p.add_argument("--all", action="store_true", help="включая выключенные адаптеры")
     p.add_argument("--no-net", action="store_true", help="не запрашивать внешний IP")
     p.add_argument("--json", action="store_true", help="вывод в формате JSON")
+    p.add_argument("--config", metavar="FILE", help="файл настроек вместо ipinfo.ini")
+    p.add_argument("--version", action="version", version="IPInfo %s" % __version__)
     args = p.parse_args()
+
+    log.info("запуск IPInfo %s, ключи: %s", __version__, " ".join(sys.argv[1:]) or "-")
+
+    if args.check or args.report:
+        cfg = config.load(args.config or config.ensure_config())
+        console_check(args, cfg)
+        return
 
     if args.json:
         data = {"adapters": get_adapters(include_down=args.all)}
@@ -492,17 +504,41 @@ def main():
 
     if not args.cli:
         try:
-            run_gui(include_down=args.all, want_external=not args.no_net)
+            run_gui(include_down=args.all, want_external=not args.no_net, cfg_path=args.config)
             return
         except Exception as e:
+            log.exception("окно не запустилось")
             print("GUI недоступен (%s), вывожу в консоль.\n" % e)
 
     print_console(get_adapters(include_down=args.all),
                   external=None if args.no_net else get_external_ip())
 
 
+def _fatal(exc):
+    """Последний рубеж: записать ошибку в журнал и показать её, а не молча закрыться."""
+    log.error("необработанная ошибка: %s", "".join(traceback.format_exception(
+        type(exc), exc, exc.__traceback__)))
+    msg = "IPInfo: %s\n\nПодробности в журнале:\n%s" % (exc, report.logs_dir())
+    if sys.stdout is not None:
+        print(msg, file=sys.stderr if sys.stderr else sys.stdout)
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, msg, "IPInfo", 0x10)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        attach_console()
+    report.setup_logging()
     try:
         main()
     except KeyboardInterrupt:
         pass
+    except SystemExit:
+        raise
+    except Exception as e:
+        _fatal(e)
+        sys.exit(1)
