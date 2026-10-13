@@ -415,3 +415,70 @@ def best_interface(ip):
             return int(f.read())
     except Exception:
         return None
+
+
+# --------------------------------------------------------------------------
+# Установленные TCP-соединения с процессом (GetExtendedTcpTable): дёшево,
+# можно опрашивать каждые пару секунд, в отличие от Get-NetTCPConnection.
+# --------------------------------------------------------------------------
+_proc_names = {}
+
+
+def _process_name(pid):
+    if pid in _proc_names:
+        return _proc_names[pid]
+    name = ""
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if h:
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.c_ulong(len(buf))
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                name = re.split(r"[\\/]", buf.value)[-1]
+                if name.lower().endswith(".exe"):
+                    name = name[:-4]
+        finally:
+            k32.CloseHandle(h)
+    if len(_proc_names) > 2000:
+        _proc_names.clear()
+    _proc_names[pid] = name
+    return name
+
+
+def tcp_connections():
+    """Установленные TCP-соединения IPv4: [{remote, rport, local, lport, pid, process}].
+
+    None, если прочитать не удалось (или не Windows).
+    """
+    if not IS_WINDOWS:
+        return None
+    import struct
+    func = ctypes.windll.iphlpapi.GetExtendedTcpTable
+    size = ctypes.c_ulong(0)
+    buf = None
+    for _ in range(5):
+        buf = ctypes.create_string_buffer(size.value or 1)
+        # AF_INET=2, TCP_TABLE_OWNER_PID_CONNECTIONS=4
+        rc = func(buf, ctypes.byref(size), False, 2, 4, 0)
+        if rc == 0:
+            break
+        if rc != 122:  # ERROR_INSUFFICIENT_BUFFER
+            return None
+    else:
+        return None
+    raw = buf.raw
+    count = struct.unpack_from("<I", raw, 0)[0]
+    res = []
+    for i in range(count):
+        state, laddr, lport, raddr, rport, pid = struct.unpack_from("<6I", raw, 4 + i * 24)
+        if state != 5:  # MIB_TCP_STATE_ESTAB
+            continue
+        res.append({
+            "remote": socket.inet_ntoa(struct.pack("<I", raddr)),
+            "rport": socket.ntohs(rport & 0xFFFF),
+            "local": socket.inet_ntoa(struct.pack("<I", laddr)),
+            "lport": socket.ntohs(lport & 0xFFFF),
+            "pid": pid, "process": _process_name(pid),
+        })
+    return res

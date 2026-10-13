@@ -2,6 +2,7 @@
 """Тесты разбора и логики диагностики. Запуск: python -m unittest discover tests"""
 
 import ctypes
+import datetime
 import os
 import sys
 import tempfile
@@ -10,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from netdiag import adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
+from netdiag import sysutil, adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
 
 
 def adapter(name, ipv4=(), up=True, iftype=6, gateway=(), dns=(), index=1, desc=""):
@@ -295,6 +296,21 @@ class DiagnoseTest(unittest.TestCase):
         self.assertEqual(c["status"], "warn")
         self.assertTrue(c["summary"].startswith("1: соединение потеряно"))
 
+    def test_vpn_connection_ignores_proxy_and_finds_client(self):
+        srv = {"name": "ztn", "host": "vpng.example.ru", "port": 443, "proto": "tcp"}
+        dns_ips = ["198.51.100.1", "198.51.100.2"]
+        proxy = {"remote": "198.51.100.1", "rport": 443, "process": "sing-box",
+                 "path": r"C:\Happ\sing-box.exe"}
+        links = {"tcp": [proxy], "routes": []}
+        self.assertIsNone(diagnose.vpn_connection(links, dns_ips, srv, self.cfg))
+        client = {"remote": "203.0.113.7", "rport": 443, "process": "ztnsvc",
+                  "path": r"C:\Program Files\Security Code\Continent ZTN\ztnsvc.exe"}
+        links["tcp"].append(client)
+        st, text, used, _ = diagnose.vpn_connection(links, dns_ips, srv, self.cfg)
+        self.assertEqual(used, ["203.0.113.7"])
+        self.assertEqual(st, diagnose.WARN)
+        self.assertIn("нет в ответе DNS", text)
+
     def test_vpn_server_with_two_ips(self):
         self.cfg["vpn"] = [{"name": "ztn", "host": "vpng.example.ru", "port": 443,
                             "proto": "tcp"}]
@@ -452,6 +468,43 @@ class MonitorTest(unittest.TestCase):
             self.m._check_rdp_log(set())
         self.assertIn("сеанс отключён", self.events[-1]["text"])
         self.assertIn("2308", self.events[-1]["text"])
+
+    @unittest.skipUnless(sysutil.IS_WINDOWS, "только Windows")
+    def test_tcp_connections_windows(self):
+        conns = monitor.ad.tcp_connections()
+        self.assertIsInstance(conns, list)
+
+    def test_rdp_event_props_name_value(self):
+        e = winsys.parse_rdp_event({"id": 1026, "props": ["Disconnect Reason", "2308"]})
+        self.assertEqual(e["reason"], 2308)
+        self.assertIn("соединение потеряно", e["reason_text"])
+        e = winsys.parse_rdp_event({"id": 1024, "props": ["Server Name", "srv.corp"]})
+        self.assertEqual(e["server"], "srv.corp")
+        self.assertEqual(winsys.parse_rdp_event({"id": 1026, "props": ["3"]})["reason"], 3)
+
+    def test_rdp_tcp_watch_and_disconnect_details(self):
+        conn = {"remote": "10.61.220.15", "rport": 3389, "lport": 50000, "pid": 7,
+                "process": "mstsc"}
+        other = {"remote": "1.1.1.1", "rport": 443, "lport": 50001, "pid": 8,
+                 "process": "chrome"}
+        with mock.patch.object(monitor.ad, "tcp_connections", side_effect=[
+                [conn, other], [dict(conn)], [other]]):
+            self.assertEqual(self.m._check_rdp_tcp(1000), 1)
+            self.m._check_rdp_tcp(1002)
+            self.assertEqual(self.m._check_rdp_tcp(1004), 0)
+        self.assertIn("закрыто", self.events[-1]["text"])
+        self.m.rdp_session = {"server": "10.61.220.15", "t": 400}
+        self.m.rdp_udp_lost = 990
+        self.m.history.append({"t": 1000, "probes": {}, "tunnel": True, "other_vpn": []})
+        with mock.patch.object(self.m, "_route_of", return_value="Continent"):
+            text = self.m.describe_disconnect({"id": 1026, "reason": 2308,
+                                               "time": datetime.datetime.fromtimestamp(
+                                                   1005).isoformat()})
+        self.assertIn("длился 10 мин 5 с", text)
+        self.assertIn("UDP-канал RDP разорвался", text)
+        self.assertIn("TCP-соединение mstsc → 10.61.220.15:3389 закрылось", text)
+        self.assertIn("через «Continent»", text)
+        self.assertIn("по неактивности", text)
 
     def test_event_epoch(self):
         self.assertIsNotNone(monitor._event_epoch("2026-10-13T18:22:54.1234567+03:00"))

@@ -63,6 +63,50 @@ def _other_vpn(adapter_list, cfg):
     return res
 
 
+def vpn_connection(links, ips, srv, cfg):
+    """К какому адресу подключён VPN-клиент: (статус, текст, адреса, данные) или None.
+
+    Сначала ищутся TCP-соединения самого клиента (по имени процесса и пути
+    к программе) - с любыми адресами, даже если DNS отдаёт другие. Соединения
+    прокси других VPN (sing-box и т.п.) не учитываются: через них идут и наши
+    собственные проверки. Потом - соединения прочих программ и маршруты /32.
+    """
+    if links is None:
+        return None
+    patterns = [w for ws in cfg["patterns"].values() for w in ws]
+    own = winsys.client_links(links, patterns)["client"]
+    port = srv["port"] if srv["proto"] == "tcp" else None
+    if own:
+        eps, used = [], []
+        for c in own:
+            ep = "%s:%s" % (c["remote"], c["rport"])
+            if ep not in eps:
+                eps.append(ep)
+            if c["remote"] not in used:
+                used.append(c["remote"])
+        text = "клиент (процесс %s) подключён к %s" % (own[0].get("process") or "?", ", ".join(eps))
+        foreign = [ip for ip in used if ip not in ips]
+        if foreign and not set(used) & set(ips):
+            text += "; этих адресов нет в ответе DNS для %s: DNS сейчас отдаёт другие " \
+                    "адреса (возможно, отвечает через другой VPN)" % srv["host"]
+            return WARN, text, used, {"client_tcp": own}
+        return OK, text, used, {"client_tcp": own}
+    sl = winsys.server_links(links, ips, port)
+    used = []
+    for c in sl["tcp"]:
+        if c["remote"] not in used:
+            used.append(c["remote"])
+    if used:
+        proc = sl["tcp"][0].get("process")
+        return OK, "клиент подключён к %s (TCP-соединение%s)" % (
+            ", ".join(used), " процесса %s" % proc if proc else ""), used, {"links": sl}
+    used = [rt["ip"] for rt in sl["routes"]]
+    if used:
+        return OK, "клиент подключён к %s (отдельный маршрут к серверу)" % ", ".join(used), \
+            used, {"links": sl}
+    return None
+
+
 def classify(adapter_list, cfg):
     """Делит адаптеры на туннели VPN, локальные и установленные, но не поднятые VPN."""
     try:
@@ -331,24 +375,17 @@ def run(cfg, progress=None):
         (vpn_ok if good else vpn_fail).append(s["name"])
 
         # К какому из адресов реально подключён клиент
-        sl = winsys.server_links(links, r["ips"], s["port"] if s["proto"] == "tcp" else None)
-        used = []
-        for c in sl["tcp"]:
-            if c["remote"] not in used:
-                used.append(c["remote"])
-        how = "TCP-соединение" + (" процесса %s" % sl["tcp"][0]["process"]
-                                  if sl["tcp"] and sl["tcp"][0].get("process") else "")
-        if not used:
-            used = [rt["ip"] for rt in sl["routes"]]
-            how = "отдельный маршрут к серверу"
-        if used:
-            vpn_connected[s["name"]] = used
-            bad = set(used) & set(vpn_bad_ips.get(s["name"], []))
-            rep.add(G, "%s: подключение" % s["name"], WARN if bad else OK,
-                    "клиент подключён к %s (%s)" % (", ".join(used), how), links=sl)
+        line = vpn_connection(links, r["ips"], s, cfg)
+        if line:
+            st, text, used, extra = line
+            if used:
+                vpn_connected[s["name"]] = used
+            if used and set(used) & set(vpn_bad_ips.get(s["name"], [])):
+                st = WARN
+            rep.add(G, "%s: подключение" % s["name"], st, text, **extra)
         elif links is not None and tunnels:
             rep.add(G, "%s: подключение" % s["name"], INFO,
-                    "соединений с адресами %s не найдено: клиент подключён к другому "
+                    "соединений клиента с адресами %s не найдено: клиент подключён к другому "
                     "серверу или по UDP" % ", ".join(r["ips"]))
 
     # ---- 4. Туннель ---------------------------------------------------------

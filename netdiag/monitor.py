@@ -27,6 +27,19 @@ WIFI_EVERY = 10       # секунд между опросами Wi-Fi (netsh)
 RDP_LOG_EVERY = 20    # секунд между чтениями журнала клиента RDP
 RDP_TCP_EVERY = 30    # секунд между проверками порта RDP-серверов
 VPN_EVERY = 30        # секунд между проверками DNS VPN-сервера и адреса подключения
+INCIDENTS_SEC = 1800  # за сколько секунд до обрыва RDP перечислять проблемы, если начало сеанса неизвестно
+# программы-клиенты RDP: их TCP-соединения отслеживаются каждый цикл
+RDP_PROCS = {"mstsc", "msrdc", "msrdcw", "rdcman", "mremoteng", "remotedesktopmanager",
+             "royalts"}
+
+
+def _hms(epoch):
+    return datetime.datetime.fromtimestamp(epoch).strftime("%H:%M:%S") if epoch else "?"
+
+
+def _minutes(sec):
+    sec = int(sec)
+    return "%d мин %d с" % (sec // 60, sec % 60) if sec >= 60 else "%d с" % sec
 
 
 def _event_epoch(iso):
@@ -71,6 +84,10 @@ class Monitor:
         self.state = {}
         self.vpn = {}          # имя сервера -> {"ips": [...], "used": [...]}
         self._vpn_fut = None
+        self.rdp_conns = None  # открытые TCP-соединения клиента RDP: ключ -> dict
+        self.rdp_closed = []   # недавно закрытые соединения клиента RDP
+        self.rdp_session = None  # {"server", "t"} - последнее подключение по журналу
+        self.rdp_udp_lost = None  # время последнего разрыва UDP-канала RDP
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.text_path = os.path.join(logs_dir(), "monitor-%s.log" % stamp)
         self.json_path = os.path.join(logs_dir(), "monitor-%s.jsonl" % stamp)
@@ -175,6 +192,7 @@ class Monitor:
         stats = self._tunnel_stats(snap)
         if self.cfg.get("vpn"):
             self._apply_vpn(self._read_vpn())
+        self._check_rdp_tcp(time.time())
         last_wifi = last_rdp_log = last_rdp_tcp = last_vpn = time.time()
         rdp_seen = set(self._rdp_event_key(e) for e in (winsys.rdp_client_events(10) or []))
         last_tick = time.time()
@@ -235,6 +253,8 @@ class Monitor:
                 last_vpn = now
                 self._vpn_fut = self.pool.submit(self._read_vpn)
             tick["vpn"] = {n: list(v.get("used") or []) for n, v in self.vpn.items()}
+
+            tick["rdp_tcp"] = self._check_rdp_tcp(now)
 
             self.history.append(tick)
             while self.history and now - self.history[0]["t"] > HISTORY_SEC:
@@ -341,11 +361,8 @@ class Monitor:
                 continue
             used = None
             if links is not None:
-                sl = winsys.server_links(links, ips, s["port"] if s["proto"] == "tcp" else None)
-                used = []
-                for ip in [c["remote"] for c in sl["tcp"]] + [r["ip"] for r in sl["routes"]]:
-                    if ip not in used:
-                        used.append(ip)
+                line = diagnose.vpn_connection(links, ips, s, self.cfg)
+                used = line[2] if line else []
             res[s["name"]] = {"host": s["host"], "ips": ips, "used": used}
         return res
 
@@ -402,16 +419,113 @@ class Monitor:
             if key in seen:
                 continue
             seen.add(key)
+            at = _event_epoch(e.get("time"))
             if e["id"] == 1024:
-                self.emit("info", "RDP: подключение к %s" % e.get("server", "?"), rdp=e)
+                self.rdp_session = {"server": e.get("server", "?"), "t": at}
+                self.emit("info", "RDP %s: подключение к %s" % (_hms(at), e.get("server", "?")),
+                          rdp=e)
             elif e["id"] == 1026:
-                cause = self.explain_disconnect(_event_epoch(e.get("time")))
+                cause = self.describe_disconnect(e)
                 self.emit("fail" if e.get("reason") not in (1, 2) else "info",
-                          "RDP: сеанс отключён - %s (код %s). %s" % (
-                              e.get("reason_text"), e.get("reason"), cause),
+                          "RDP %s: сеанс отключён - %s (код %s).\n%s" % (
+                              _hms(at), e.get("reason_text"), e.get("reason"), cause),
                           rdp=e, cause=cause)
             elif e["id"] == 1105:
-                self.emit("warn", "RDP: UDP-соединение разорвано, сеанс перешёл на TCP", rdp=e)
+                self.rdp_udp_lost = at
+                self.emit("warn", "RDP %s: UDP-канал разорван, сеанс перешёл на TCP" % _hms(at),
+                          rdp=e)
+
+    # ---- TCP-соединения клиента RDP ------------------------------------------
+    def _is_rdp_conn(self, c):
+        if (c.get("process") or "").lower() in RDP_PROCS or c.get("rport") == 3389:
+            return True
+        return any(c.get("remote") == t.get("ip") and c.get("rport") == t.get("port")
+                   for t in self.rdp_targets)
+
+    def _check_rdp_tcp(self, now):
+        """Сравнивает открытые TCP-соединения клиента RDP с прошлым циклом.
+
+        Возвращает число открытых соединений (None, если прочитать не удалось)."""
+        conns = ad.tcp_connections()
+        if conns is None:
+            return None
+        cur = {}
+        for c in conns:
+            if self._is_rdp_conn(c):
+                cur[(c["remote"], c["rport"], c["lport"])] = c
+        first = self.rdp_conns is None
+        old = self.rdp_conns or {}
+        for k, c in cur.items():
+            if k in old:
+                c["since"] = old[k].get("since")
+                continue
+            c["since"] = None if first else now
+            self.emit("info", "RDP: TCP-соединение %s → %s:%d %s" % (
+                c.get("process") or "pid %s" % c.get("pid"), c["remote"], c["rport"],
+                "уже открыто" if first else "открыто"), rdp_tcp=c)
+        for k, c in old.items():
+            if k in cur:
+                continue
+            closed = dict(c, closed=now)
+            self.rdp_closed = (self.rdp_closed + [closed])[-20:]
+            lived = (" (было открыто %s)" % _minutes(now - c["since"])) if c.get("since") else ""
+            self.emit("warn", "RDP: TCP-соединение %s → %s:%d закрыто%s" % (
+                c.get("process") or "pid %s" % c.get("pid"), c["remote"], c["rport"], lived),
+                rdp_tcp=closed)
+        self.rdp_conns = cur
+        return len(cur)
+
+    def _route_of(self, ip):
+        """Через какой адаптер идёт трафик к ip."""
+        idx = ad.best_interface(ip)
+        if idx is None:
+            return None
+        for a in ad.get_adapters(include_down=True):
+            if a.get("index") == idx:
+                return a["name"]
+        return None
+
+    def describe_disconnect(self, e):
+        """Подробный разбор отключения RDP: сеанс, UDP, TCP, маршрут, проблемы сети."""
+        at = _event_epoch(e.get("time")) or time.time()
+        out = []
+        sess = self.rdp_session if self.rdp_session and (self.rdp_session.get("t") or 0) <= at \
+            else None
+        if sess and sess.get("t"):
+            out.append("Сеанс к %s с %s, длился %s." % (sess["server"], _hms(sess["t"]),
+                                                       _minutes(at - sess["t"])))
+        start = (sess or {}).get("t") or max(self.started or at, at - INCIDENTS_SEC)
+        if self.rdp_udp_lost and start <= self.rdp_udp_lost <= at + 5:
+            out.append("UDP-канал RDP разорвался в %s, за %s до отключения." % (
+                _hms(self.rdp_udp_lost), _minutes(max(0, at - self.rdp_udp_lost))))
+        closed = [c for c in self.rdp_closed if at - 600 <= c["closed"] <= at + 60]
+        for c in closed[-2:]:
+            out.append("TCP-соединение %s → %s:%d закрылось в %s." % (
+                c.get("process") or "RDP", c["remote"], c["rport"], _hms(c["closed"])))
+        ip = (closed[-1]["remote"] if closed else
+              next((t["ip"] for t in self.rdp_targets
+                    if sess and t["host"] in (sess.get("server") or "")), None))
+        if ip:
+            via = self._route_of(ip)
+            if via:
+                out.append("Трафик к %s идёт через «%s»." % (ip, via))
+        incidents = [ev for ev in self.events
+                     if ev["level"] in ("warn", "fail") and not ev.get("rdp")
+                     and not ev.get("rdp_tcp")
+                     and start - 5 <= (_event_epoch(ev["time"]) or 0) <= at + 5]
+        if incidents:
+            out.append("Проблемы сети за время сеанса: " + "; ".join(
+                "%s %s" % (ev["time"][11:19], ev["text"]) for ev in incidents[-6:]) + ".")
+        window = self.explain_disconnect(at)
+        if e.get("reason") == 2308 and not incidents and window.startswith("Сеть, интернет"):
+            out.append("Сеть и туннель за это время не пропадали. Код 2308 значит, что "
+                       "TCP-соединение RDP было закрыто. Если обрыв обнаружился, когда вы "
+                       "вернулись к окну после простоя, соединение, скорее всего, закрыл по "
+                       "неактивности кто-то на пути: VPN-клиент, другой VPN или NAT роутера. "
+                       "Клиент RDP узнаёт об этом только при первой попытке отправить данные.")
+        else:
+            out.append(window)
+        return "\n".join("    " + line for line in out)
 
     def explain_disconnect(self, at=None, window=30):
         """Что пропадало за window секунд до момента at (время события RDP)."""

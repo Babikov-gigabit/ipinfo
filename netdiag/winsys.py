@@ -310,6 +310,31 @@ $start = (Get-Date).AddMinutes(-%d)
 """
 
 
+def _event_value(props):
+    """Значение из полей события. У событий клиента RDP поля идут парами
+    «название, значение»: ["Disconnect Reason", "2308"], ["Server Name", "host"]."""
+    props = [p for p in props or [] if p not in (None, "")]
+    if len(props) >= 2 and not props[0].strip().lstrip("-").isdigit():
+        return props[1]
+    return props[0] if props else None
+
+
+def parse_rdp_event(e):
+    """Дополняет событие клиента RDP: text, для 1026 - reason/reason_text, для 1024 - server."""
+    e["text"] = RDP_EVENT_TEXT.get(e.get("id"), "событие %s" % e.get("id"))
+    value = _event_value(e.get("props"))
+    if e.get("id") == 1026 and value is not None:
+        try:
+            code = int(value)
+        except ValueError:
+            code = None
+        e["reason"] = code
+        e["reason_text"] = RDP_DISCONNECT_REASON.get(code, "код %s" % value)
+    elif e.get("id") == 1024 and value is not None:
+        e["server"] = value
+    return e
+
+
 def rdp_client_events(minutes=60):
     """События клиента RDP за последние minutes минут. [] если нет, None вне Windows."""
     if not IS_WINDOWS:
@@ -320,17 +345,7 @@ def rdp_client_events(minutes=60):
     if not isinstance(data, list):
         return []
     for e in data:
-        e["text"] = RDP_EVENT_TEXT.get(e.get("id"), "событие %s" % e.get("id"))
-        props = e.get("props") or []
-        if e.get("id") == 1026 and props:
-            try:
-                code = int(props[0])
-            except ValueError:
-                code = None
-            e["reason"] = code
-            e["reason_text"] = RDP_DISCONNECT_REASON.get(code, "код %s" % props[0])
-        elif e.get("id") == 1024 and props:
-            e["server"] = props[0]
+        parse_rdp_event(e)
     return data
 
 
@@ -345,7 +360,7 @@ $r.tcp = @(Get-NetTCPConnection -State Established | ForEach-Object {
 $r.procs = @{}
 foreach ($i in ($r.tcp | ForEach-Object { $_.procid } | Sort-Object -Unique)) {
   $p = Get-Process -Id $i -ErrorAction SilentlyContinue
-  if ($p) { $r.procs[[string]$i] = $p.ProcessName } }
+  if ($p) { $r.procs[[string]$i] = $p.ProcessName + '|' + [string]$p.Path } }
 $r.routes = @(Get-NetRoute -AddressFamily IPv4 | Where-Object { $_.DestinationPrefix -like '*/32' } |
   ForEach-Object { @{ prefix = [string]$_.DestinationPrefix; ifindex = [int]$_.InterfaceIndex;
                       nexthop = [string]$_.NextHop } })
@@ -365,11 +380,35 @@ def network_links():
     if isinstance(tcp, dict):
         tcp = [tcp]
     for c in tcp:
-        c["process"] = procs.get(str(c.get("procid")), "")
+        name, _, path = procs.get(str(c.get("procid")), "").partition("|")
+        c["process"], c["path"] = name, path
     routes = data.get("routes") or []
     if isinstance(routes, dict):
         routes = [routes]
     return {"tcp": tcp, "routes": routes}
+
+
+# процессы-прокси: их соединения - это чужой трафик (в том числе наши же проверки),
+# проходящий через другой VPN, а не подключение VPN-клиента
+PROXY_PROCS = ("sing-box", "happ", "xray", "v2ray", "clash", "mihomo", "hiddify", "nekobox",
+               "nekoray", "outline", "amnezia", "wireguard", "tun2socks", "ipinfo")
+
+
+def _proc_matches(c, words):
+    text = ("%s %s" % (c.get("process") or "", c.get("path") or "")).lower()
+    return any(w.lower() in text for w in words if w)
+
+
+def client_links(links, client_patterns, other_patterns=()):
+    """TCP-соединения самого VPN-клиента (по имени процесса и пути к программе)
+    и соединения процессов-прокси других VPN."""
+    res = {"client": [], "proxy": []}
+    for c in (links or {}).get("tcp", []):
+        if _proc_matches(c, PROXY_PROCS + tuple(other_patterns)):
+            res["proxy"].append(c)
+        elif _proc_matches(c, client_patterns):
+            res["client"].append(c)
+    return res
 
 
 def server_links(links, ips, port=None):
@@ -384,6 +423,8 @@ def server_links(links, ips, port=None):
         return res
     ipset = set(ips)
     for c in links.get("tcp", []):
+        if _proc_matches(c, PROXY_PROCS):
+            continue  # через прокси другого VPN идут и наши собственные проверки
         if c.get("remote") in ipset and (port is None or c.get("rport") == port):
             res["tcp"].append(c)
     for r in links.get("routes", []):
