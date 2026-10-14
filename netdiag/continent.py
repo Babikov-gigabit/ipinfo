@@ -23,6 +23,23 @@ _NOT_HOSTS = re.compile(r"\.(json|xml|exe|dll|log|txt|cer|crt|pem|p7b|xsl|ini)$|
 _HOST_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$", re.I)
 
 
+# Пароли и прочие секреты не читаются никогда: такие поля выбрасываются
+# прямо при разборе json, а файлы с такими именами не открываются вовсе.
+SENSITIVE = re.compile(r"pass|pwd|secret|token|pin|key|cred|cookie|auth|login|cert|container",
+                       re.I)
+
+
+def is_sensitive_file(path):
+    return bool(SENSITIVE.search(os.path.basename(path)))
+
+
+def load_json_safe(path):
+    """json без секретных полей (их значения отбрасываются при разборе)."""
+    with open(path, encoding="utf-8-sig") as f:
+        return json.load(f, object_pairs_hook=lambda pairs: {
+            k: v for k, v in pairs if not SENSITIVE.search(str(k))})
+
+
 def _env(name, default=""):
     return os.environ.get(name, default)
 
@@ -93,7 +110,9 @@ def log_files(max_files=40):
     for d in log_dirs():
         for root, _dirs, names in os.walk(d):
             for n in names:
-                if re.search(r"\.(log|txt|json|xml|trace)(\.\d+)?$", n, re.I) or "log" in n.lower():
+                if is_sensitive_file(n) or re.search(r"\.(json|xml|ini|cfg|conf|dat|db)$", n, re.I):
+                    continue  # настройки и профили могут хранить пароли - в отчёт не берём
+                if re.search(r"\.(log|txt|trace)(\.\d+)?$", n, re.I) or "log" in n.lower():
                     files.append(os.path.join(root, n))
     files = [f for f in files if os.path.isfile(f)]
     files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
@@ -171,7 +190,7 @@ def _json_files(max_size=2 * 1024 * 1024):
     for d in dirs:
         for root, _dirs, names in os.walk(d):
             for n in names:
-                if n.lower().endswith(".json"):
+                if n.lower().endswith(".json") and not is_sensitive_file(n):
                     path = os.path.join(root, n)
                     try:
                         if os.path.getsize(path) <= max_size:
@@ -185,8 +204,7 @@ def profiles():
     res = []
     for path in _json_files():
         try:
-            with open(path, encoding="utf-8-sig") as f:
-                data = json.load(f)
+            data = load_json_safe(path)
         except (OSError, ValueError):
             continue
         for p in profiles_from_data(data, path):
@@ -233,9 +251,8 @@ def info():
            "collector": collector_path(), "profiles": []}
     for path in config_files():
         try:
-            with open(path, encoding="utf-8-sig") as f:
-                res["servers"] += [s for s in servers_from_config(json.load(f))
-                                   if s not in res["servers"]]
+            res["servers"] += [s for s in servers_from_config(load_json_safe(path))
+                               if s not in res["servers"]]
         except (OSError, ValueError) as e:
             res["config_error"] = "%s: %s" % (os.path.basename(path), e)
     try:

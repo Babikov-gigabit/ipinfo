@@ -123,7 +123,11 @@ def _add_continent(z):
     notes = []
     try:
         for f in continent.config_files():
-            z.write(f, "continent/" + os.path.basename(f))
+            try:  # копия без паролей и прочих секретных полей, не сам файл
+                z.writestr("continent/" + os.path.basename(f), json.dumps(
+                    continent.load_json_safe(f), ensure_ascii=False, indent=2))
+            except (OSError, ValueError) as e:
+                notes.append("Континент: %s - %s" % (f, e))
         total = 0
         for f in continent.log_files():
             if total >= MAX_CONTINENT_LOGS:

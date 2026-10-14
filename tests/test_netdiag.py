@@ -3,6 +3,7 @@
 
 import ctypes
 import datetime
+import json
 import os
 import sys
 import tempfile
@@ -363,6 +364,22 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("1) vpn-a.example.ru:443, 2) 203.0.113.9:8443",
                       c["Континент: профиль «Работа»"]["summary"])
         self.assertEqual(c["Системный прокси"]["status"], "warn")
+
+    def test_continent_never_keeps_secrets(self):
+        with tempfile.TemporaryDirectory() as d:
+            prof = os.path.join(d, "profiles.json")
+            with open(prof, "w", encoding="utf-8") as f:
+                json.dump({"name": "Работа", "password": "secret1", "passwordEncrypted": True,
+                           "login": "user", "containerPassword": "secret2",
+                           "connections": [{"host": "vpn.example.ru", "tcpPort": 443}]}, f)
+            for n in ("client.log", "password.txt", "keys.log"):
+                open(os.path.join(d, n), "w").close()
+            data = continent.load_json_safe(prof)
+            self.assertNotIn("secret", json.dumps(data))
+            self.assertEqual(data["connections"][0]["host"], "vpn.example.ru")
+            with mock.patch.object(continent, "log_dirs", return_value=[d]):
+                names = [os.path.basename(f) for f in continent.log_files()]
+        self.assertEqual(names, ["client.log"])
 
     def test_vpn_connection_from_host_route(self):
         srv = {"name": "ztn", "host": "vpng.example.ru", "port": 443, "proto": "tcp"}
