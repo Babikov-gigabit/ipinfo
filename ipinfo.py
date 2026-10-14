@@ -25,7 +25,7 @@ import threading
 import time
 import traceback
 
-from netdiag import __version__, adapters as ad, config, diagnose, live, monitor, probes, report
+from netdiag import __version__, adapters as ad, config, diagnose, fixes, live, monitor, probes, report
 from netdiag.sysutil import attach_console, reports_folder, resource_path
 
 ICON_NAME = "ip-icon.ico"
@@ -196,6 +196,7 @@ def run_gui(include_down, want_external, cfg_path=None):
     check_btn = head_button("ПРОВЕРКА")
     monitor_btn = head_button("МОНИТОРИНГ")
     info_btn = head_button("ИНФО")
+    fix_btn = head_button("FIX")
 
     # --- прокручиваемая область ----------------------------------------
     canvas = tk.Canvas(left, bg=BG, highlightthickness=0, bd=0)
@@ -361,6 +362,7 @@ def run_gui(include_down, want_external, cfg_path=None):
     pages = {}
     tab_labels = {}
     panel = {"open": False, "tab": None, "anim": None}
+    on_tab = {}  # вкладка -> что обновить при её показе
 
     def show_tab(name):
         panel["tab"] = name
@@ -369,6 +371,8 @@ def run_gui(include_down, want_external, cfg_path=None):
             tab_labels[n].config(fg=FG if n == name else FG_MUTED,
                                  font=(family, 9, "bold" if n == name else "normal"))
         pages[name].pack(fill="both", expand=True)
+        if name in on_tab:
+            on_tab[name]()
 
     def animate(target_w, done=None, last=None):
         """Плавно меняет ширину окна, не уводя его за край экрана."""
@@ -430,6 +434,7 @@ def run_gui(include_down, want_external, cfg_path=None):
     tab_button("info", "ИНФОРМАЦИЯ")
     tab_button("check", "ПРОВЕРКА")
     tab_button("monitor", "МОНИТОРИНГ")
+    tab_button("fix", "FIX")
     hide = tk.Label(tabs, text="скрыть  ›", font=f_meta, fg=FG_MUTED, bg=BG, cursor="hand2")
     hide.pack(side="right")
     hide.bind("<Button-1>", close_panel)
@@ -633,6 +638,65 @@ def run_gui(include_down, want_external, cfg_path=None):
             in_background(info.read, show_info)
         root.after(2000, info_tick)
 
+    # --- исправления ----------------------------------------------------
+    fix_page = tk.Frame(body_side, bg=BG)
+    pages["fix"] = fix_page
+    fx = tk.Frame(fix_page, bg=BG)
+    fx.pack(fill="both", expand=True, padx=16, pady=(12, 0))
+    tk.Label(fx, text="RDP: СЕАНС В СВЁРНУТОМ ОКНЕ", font=(family, 8, "bold"), fg=FG_MUTED,
+             bg=BG, anchor="w").pack(fill="x")
+    tk.Label(fx, text="Когда окно удалённого рабочего стола свёрнуто, Windows перестаёт его "
+             "обновлять, и сеанс может зависнуть или оборваться. RDP-FIX оставляет сеанс "
+             "активным в свёрнутом окне (параметр %s = 2 в реестре).\n"
+             "RDP_Fix_del возвращает стандартное поведение (удаляет параметр).\n"
+             "Нужны права администратора: Windows попросит подтвердить. После изменения "
+             "закройте все окна RDP и подключитесь заново." % fixes.RDP_VALUE,
+             font=f_head, fg=FG, bg=BG, anchor="w", justify="left",
+             wraplength=PANEL_W - 60).pack(fill="x", pady=(6, 10))
+    fix_state = tk.Label(fx, text="", font=f_head, fg=FG_MUTED, bg=BG, anchor="w",
+                         justify="left", wraplength=PANEL_W - 60)
+    fix_state.pack(fill="x", pady=(0, 10))
+    fix_row = tk.Frame(fx, bg=BG)
+    fix_row.pack(fill="x")
+    fix_msg = tk.Label(fx, text="", font=f_head, fg=FG_MUTED, bg=BG, anchor="w",
+                       justify="left", wraplength=PANEL_W - 60)
+    fix_msg.pack(fill="x", pady=(10, 0))
+    fix_busy = {"on": False}
+
+    def show_fix_state():
+        value = fixes.rdp_fix_state()
+        fix_state.config(text="Сейчас: " + fixes.describe_state(value),
+                         fg=FG_OK if value == fixes.RDP_FIX_DATA else FG_MUTED)
+
+    def apply_fix(enable):
+        if fix_busy["on"]:
+            return
+        fix_busy["on"] = True
+        fix_msg.config(text="меняю параметр… подтвердите запрос Windows, если он появится",
+                       fg=FG_MUTED)
+
+        def done(res):
+            fix_busy["on"] = False
+            if isinstance(res, Exception):
+                res = (False, str(res))
+            ok, text = res
+            fix_msg.config(text=text, fg=FG_OK if ok else FG_FAIL)
+            log.info("RDP-FIX %s: %s", "включение" if enable else "отмена", text)
+            show_fix_state()
+        in_background(lambda: fixes.set_rdp_fix(enable), done)
+
+    def fix_button(text, color, hover, cmd):
+        b = tk.Label(fix_row, text=text, font=(family, 10, "bold"), fg="#ffffff", bg=color,
+                     cursor="hand2", padx=18, pady=8)
+        b.pack(side="left", padx=(0, 10))
+        b.bind("<Button-1>", lambda _e: cmd())
+        b.bind("<Enter>", lambda _e: b.config(bg=hover))
+        b.bind("<Leave>", lambda _e: b.config(bg=color))
+
+    on_tab["fix"] = show_fix_state
+    fix_button("RDP-FIX", ACCENT, ACCENT_HOVER, lambda: apply_fix(True))
+    fix_button("RDP_Fix_del", "#6b7280", "#4b5563", lambda: apply_fix(False))
+
     # --- одна кнопка: проверка + отчёт ----------------------------------
     rep_state = {"busy": False}
 
@@ -678,6 +742,9 @@ def run_gui(include_down, want_external, cfg_path=None):
         if not run_state["data"] and not run_state["busy"]:
             start_check()
 
+    def open_fix(_e=None):
+        open_panel("fix")
+
     def open_info(_e=None):
         open_panel("info")
         if not info_state["busy"]:
@@ -700,6 +767,7 @@ def run_gui(include_down, want_external, cfg_path=None):
     check_btn.bind("<Button-1>", open_check)
     monitor_btn.bind("<Button-1>", open_monitor)
     info_btn.bind("<Button-1>", open_info)
+    fix_btn.bind("<Button-1>", open_fix)
     root.bind("<F5>", refresh)
     root.bind("<Escape>", lambda _e: close_panel() if panel["open"] else on_close())
     root.protocol("WM_DELETE_WINDOW", on_close)

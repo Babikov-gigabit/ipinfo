@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from netdiag import sysutil, live, session, continent, adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
+from netdiag import sysutil, fixes, live, session, continent, adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
 
 
 def adapter(name, ipv4=(), up=True, iftype=6, gateway=(), dns=(), index=1, desc=""):
@@ -498,6 +498,18 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("Итог", page)
         self.assertIn("туннель «Continent» пропал<br>", page)
         self.assertIn("мониторинг 5 мин", page)
+
+
+class FixesTest(unittest.TestCase):
+    def test_reg_args(self):
+        self.assertEqual(fixes.reg_args(True), [
+            "add", r"HKLM\Software\Microsoft\Terminal Server Client", "/v",
+            "RemoteDesktop_SuppressWhenMinimized", "/t", "REG_DWORD", "/d", "2", "/f", "/reg:64"])
+        self.assertEqual(fixes.reg_args(False)[:4], [
+            "delete", r"HKLM\Software\Microsoft\Terminal Server Client", "/v",
+            "RemoteDesktop_SuppressWhenMinimized"])
+        self.assertIn("стандартное", fixes.describe_state(None))
+        self.assertIn("включено", fixes.describe_state(2))
 
 
 class LiveTest(unittest.TestCase):
