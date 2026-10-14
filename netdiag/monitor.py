@@ -18,13 +18,15 @@ import os
 import threading
 import time
 
-from . import adapters as ad, continent, diagnose, probes, winsys
+from . import adapters as ad, continent, diagnose, probes, session, sysutil, winsys
 from .report import logs_dir, log
 
 HISTORY_SEC = 120     # сколько секунд истории держать для разбора обрыва RDP
 FAILS_TO_DOWN = 2     # столько неудач подряд - считаем узел недоступным
 WIFI_EVERY = 10       # секунд между опросами Wi-Fi (netsh)
 RDP_LOG_EVERY = 20    # секунд между чтениями журнала клиента RDP
+SESSION_EVERY = 60    # секунд между чтениями журналов блокировки, сна и сеансов этого ПК
+SAME_IDLE_SEC = 90    # обрывы после простоя, отличающегося меньше чем на столько, - "одинаковые"
 RDP_TCP_EVERY = 30    # секунд между проверками порта RDP-серверов
 VPN_EVERY = 30        # секунд между проверками DNS VPN-сервера и адреса подключения
 INCIDENTS_SEC = 1800  # за сколько секунд до обрыва RDP перечислять проблемы, если начало сеанса неизвестно
@@ -90,6 +92,9 @@ class Monitor:
         self.rdp_closed = []   # недавно закрытые соединения клиента RDP
         self.rdp_session = None  # {"server", "t"} - последнее подключение по журналу
         self.rdp_udp_lost = None  # время последнего разрыва UDP-канала RDP
+        self.last_input = None   # время последнего ввода с клавиатуры/мыши на этом ПК
+        self.drop_idles = []     # простой перед каждым обрывом RDP, секунд
+        self.sess_recent = []    # недавние события блокировки, сна и сеансов этого ПК
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         # текстовый журнал - для человека, его можно класть в папку отчётов
         self.text_path = os.path.join(out_dir, "Мониторинг %s.txt" % datetime.datetime.now()
@@ -204,6 +209,9 @@ class Monitor:
         self._check_tcp(time.time())
         last_wifi = last_rdp_log = last_rdp_tcp = last_vpn = time.time()
         rdp_seen = set(self._rdp_event_key(e) for e in (winsys.rdp_client_events(10) or []))
+        sess_seen = set(self._rdp_event_key(e) for e in
+                        ((session.events(10) or {}).get("events") or []))
+        last_sess = time.time()
         last_tick = time.time()
 
         while not self.stop_event.wait(self.interval):
@@ -216,6 +224,10 @@ class Monitor:
             # пинги параллельно
             futs = {p: self.pool.submit(probes.echo, p.ip, 32, 1000) for p in self.probes}
             tick = {"t": now, "probes": {}}
+            idle = sysutil.idle_seconds()
+            if idle is not None:
+                self.last_input = now - idle
+                tick["last_input"] = self.last_input
             for p, f in futs.items():
                 st, rtt = f.result()
                 self._update_probe(p, st == probes.IP_SUCCESS, rtt, now)
@@ -272,6 +284,9 @@ class Monitor:
             if now - last_rdp_log >= RDP_LOG_EVERY:
                 last_rdp_log = now
                 self._check_rdp_log(rdp_seen)
+            if now - last_sess >= SESSION_EVERY:
+                last_sess = now
+                self._check_session_events(sess_seen)
 
         self._check_rdp_log(rdp_seen)
         self.emit("info", self.summary())
@@ -468,6 +483,44 @@ class Monitor:
                 return "%s → %s:%d" % (c.get("process") or "RDP", c["remote"], c["rport"])
         return None
 
+    def _check_session_events(self, seen, evs=None):
+        """Блокировка, заставка, сон и отключения сеансов RDP на этом ПК - нужно,
+        когда IPInfo запущен на ПК, к которому подключаются по RDP."""
+        if evs is None:
+            evs = (session.events(5) or {}).get("events") or []
+        for e in evs:
+            key = self._rdp_event_key(e)
+            if key in seen:
+                continue
+            seen.add(key)
+            self.sess_recent = (self.sess_recent + [e])[-50:]
+            at = _event_epoch(e.get("time"))
+            if e.get("id") in session.DISCONNECT_IDS and \
+                    (e.get("source") or "").upper() != "LOCAL":
+                c = session.correlate(self.sess_recent)
+                last = c[-1] if c else {}
+                text = "этот ПК %s: %s" % (_hms(at), e["text"])
+                if last.get("after"):
+                    text += " - через %d с после «%s»: сеанс отключился из-за " \
+                            "блокировки, заставки или сна" % (last["gap"], last["after"])
+                self.emit("warn", text, session_event=e)
+            elif e.get("id") == 40 and e.get("reason") not in (5, 11, 12):
+                self.emit("warn" if e.get("reason") == 3 else "info",
+                          "этот ПК %s: %s" % (_hms(at), e["text"]), session_event=e)
+            elif e.get("id") in (4800, 4801, 4802, 4803, 42, 107, 1):
+                self.emit("info", "этот ПК %s: %s" % (_hms(at), e["text"]), session_event=e)
+
+    def _idle_at(self, at):
+        """Сколько секунд не было ввода на этом ПК к моменту at (None - неизвестно)."""
+        last = None
+        for t in self.history:
+            if t["t"] > at + self.interval:
+                break
+            last = t.get("last_input", last)
+        if last is None or last > at:
+            return None
+        return at - last
+
     # ---- TCP-соединения клиента RDP ------------------------------------------
     def _is_rdp_conn(self, c):
         if (c.get("process") or "").lower() in RDP_PROCS or c.get("rport") == 3389:
@@ -599,6 +652,20 @@ class Monitor:
         if incidents:
             out.append("Проблемы сети за время сеанса: " + "; ".join(
                 "%s %s" % (ev["time"][11:19], ev["text"]) for ev in incidents[-6:]) + ".")
+        idle = self._idle_at(at)
+        if idle is not None:
+            out.append("До обрыва с этим ПК не работали %s (последнее действие в %s)." % (
+                _minutes(idle), _hms(at - idle)))
+            if e.get("reason") not in winsys.RDP_NOT_DROP and idle >= 60:
+                same = [x for x in self.drop_idles if abs(x - idle) <= SAME_IDLE_SEC]
+                self.drop_idles.append(idle)
+                if same:
+                    out.append("Обрыв уже %d-й раз после одинакового простоя (около %s): "
+                               "похоже на таймер - блокировку, заставку, сон или лимит "
+                               "простоя на удалённом ПК, либо обрыв простаивающего соединения "
+                               "VPN или роутером. Запустите IPInfo на удалённом ПК: он покажет "
+                               "там таймеры и время блокировки." % (len(same) + 1,
+                                                                    _minutes(idle)))
         window = self.explain_disconnect(at)
         if e.get("reason") == 2308 and not incidents and window.startswith("Сеть, интернет"):
             out.append("Сеть и туннель за это время не пропадали. Код 2308 значит, что "

@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from netdiag import sysutil, continent, adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
+from netdiag import sysutil, session, continent, adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
 
 
 def adapter(name, ipv4=(), up=True, iftype=6, gateway=(), dns=(), index=1, desc=""):
@@ -500,6 +500,45 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("мониторинг 5 мин", page)
 
 
+class SessionTest(unittest.TestCase):
+    EVS = [
+        {"time": "2026-10-14T12:00:00.1+03:00", "id": 21, "props": ["CORP\\ivan", "2", "10.61.30.91"]},
+        {"time": "2026-10-14T12:15:00.1+03:00", "id": 4800, "props": []},
+        {"time": "2026-10-14T12:15:40.1+03:00", "id": 24, "props": ["CORP\\ivan", "2", "10.61.30.91"]},
+        {"time": "2026-10-14T12:15:40.2+03:00", "id": 40, "props": ["2", "0"]},
+        {"time": "2026-10-14T13:00:00.1+03:00", "id": 24, "props": ["CORP\\ivan", "3", "LOCAL"]},
+        {"time": "2026-10-14T14:00:00.1+03:00", "id": 24, "props": ["CORP\\ivan", "2", "10.61.30.91"]},
+        {"time": "2026-10-14T14:00:00.2+03:00", "id": 40, "props": ["2", "3"]},
+    ]
+
+    def evs(self):
+        return [session.parse_event(dict(e)) for e in self.EVS]
+
+    def test_correlate_lock_then_disconnect(self):
+        c = session.correlate(self.evs())
+        self.assertEqual(len(c), 2)  # LOCAL пропущен
+        self.assertEqual((c[0]["after"], c[0]["gap"], c[0]["reason"]),
+                         ("компьютер заблокирован", 40, 0))
+        self.assertIsNone(c[1]["after"])
+        self.assertEqual(c[1]["reason"], 3)
+
+    def test_summarize_and_timers(self):
+        st, text = session.summarize({}, {"events": self.evs(), "denied": ["Security"]})
+        self.assertEqual(st, "warn")
+        self.assertIn("сразу после блокировки, заставки или сна: 1 (12:15:40 через 40 с", text)
+        self.assertIn("по лимиту простоя сервера: 1", text)
+        self.assertIn("от имени администратора", text)
+        lines = session.describe_timers({"lock_inactivity": 900, "screensaver_active": "1",
+                                         "screensaver_timeout": 600, "screensaver_secure": "1",
+                                         "rdp_idle": 3600, "sleep_ac": 1800})
+        text = "; ".join(t for t, _ in lines)
+        self.assertIn("блокировка по простою (политика): через 15 мин", text)
+        self.assertIn("заставка через 10 мин, с блокировкой", text)
+        self.assertIn("лимит простоя сеанса RDP: через 1 ч", text)
+        self.assertIn("сон через 30 мин", text)
+        self.assertTrue(any(imp for _, imp in lines))
+
+
 class MonitorTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -605,6 +644,28 @@ class MonitorTest(unittest.TestCase):
             self.m._check_rdp_log(set())
         self.assertIn("сеанс отключён", self.events[-1]["text"])
         self.assertIn("2308", self.events[-1]["text"])
+
+    def test_rdp_drop_after_same_idle(self):
+        B = 1760000000
+        self.m.history.extend([{"t": B + 100, "probes": {}, "last_input": B},
+                               {"t": B + 1000, "probes": {}, "last_input": B + 1000},
+                               {"t": B + 2000, "probes": {}, "last_input": B + 1300}])
+        with mock.patch.object(self.m, "_route_of", return_value=None):
+            t1 = self.m.describe_disconnect({"id": 1026, "reason": 2308,
+                                             "time": datetime.datetime.fromtimestamp(B + 900).isoformat()})
+            t2 = self.m.describe_disconnect({"id": 1026, "reason": 2308,
+                                             "time": datetime.datetime.fromtimestamp(B + 1920).isoformat()})
+        self.assertIn("не работали 15 мин", t1)
+        self.assertNotIn("одинакового простоя", t1)
+        self.assertIn("2-й раз после одинакового простоя", t2)
+
+    def test_session_lock_then_disconnect_logged(self):
+        evs = [session.parse_event(dict(e)) for e in SessionTest.EVS[:4]]
+        self.m._check_session_events(set(), evs)
+        texts = [e["text"] for e in self.events]
+        self.assertTrue(any("компьютер заблокирован" in t for t in texts))
+        warn = [e for e in self.events if e["level"] == "warn"]
+        self.assertIn("через 40 с после «компьютер заблокирован»", warn[0]["text"])
 
     def test_rdp_disconnect_while_session_alive_is_not_error(self):
         evs = [{"time": None, "id": 1105, "props": []},

@@ -17,7 +17,7 @@ import platform
 import socket
 import time
 
-from . import __version__, adapters as ad, continent, probes, winsys
+from . import __version__, adapters as ad, continent, probes, session, winsys
 
 OK, WARN, FAIL, INFO = "ok", "warn", "fail", "info"
 
@@ -433,6 +433,8 @@ def run(cfg, progress=None):
     f_dev = pool.submit(winsys.net_devices)
     f_links = pool.submit(winsys.network_links)
     f_rdplog = pool.submit(winsys.rdp_client_events, 24 * 60)
+    f_stimers = pool.submit(session.timers)
+    f_sevents = pool.submit(session.events, 24 * 60)
 
     # ---- 1. Локальная сеть ------------------------------------------------
     G = "Локальная сеть"
@@ -679,6 +681,18 @@ def run(cfg, progress=None):
             drops[-1]["time"][:19].replace("T", " ")), events=drops)
     elif rdp_log is not None:
         rep.add(G, "Обрывы за сутки", OK, "по журналу клиента RDP обрывов не было")
+    s_timers, s_events = f_stimers.result(), f_sevents.result()
+    tlines = session.describe_timers(s_timers)
+    if s_timers is not None:
+        rep.add(G, "Таймеры этого ПК", WARN if any(imp for _t, imp in tlines) else INFO,
+                ("; ".join(t for t, _imp in tlines) if tlines else
+                 "блокировка, заставка, сон и лимиты сеанса RDP не настроены") +
+                ". Если обрывается RDP к другому ПК, запустите IPInfo на нём: важны его таймеры",
+                timers=s_timers)
+    s_sum = session.summarize(s_timers, s_events)
+    if s_sum:
+        rep.add(G, "Сеансы RDP на этом ПК", s_sum[0], s_sum[1],
+                events=(s_events or {}).get("events"))
     if not cfg.get("rdp_targets"):
         rep.add(G, "Настройки", INFO,
                 "RDP-серверы не заданы: добавьте их в раздел [rdp] targets файла ipinfo.ini")
@@ -702,6 +716,8 @@ def run(cfg, progress=None):
         "external_ip": ext_ip,
         "rdp": rdp,
         "rdp_client_events": rdp_log,
+        "session_timers": s_timers,
+        "session_events": s_events,
         "net_devices": devices,
         "other_vpn": [a["name"] for a in other_vpn],
         "vpn_via_other": vpn_via_other,
@@ -718,6 +734,13 @@ def run(cfg, progress=None):
                               dns_fail=dns_fail, vpn_ok=vpn_ok, vpn_fail=vpn_fail,
                               tunnels=tunnels, int_ok=int_ok, int_total=int_total,
                               rdp_problems=rdp_problems, device_problems=device_problems)
+    locked = [d for d in session.correlate((s_events or {}).get("events") or []) if d["after"]]
+    if locked:
+        data["verdict"].append(
+            "Сеанс RDP на этом ПК %d раз отключался сразу после блокировки, заставки или сна "
+            "(последний раз в %s, через %d с после «%s»): обрыв связан с таймером "
+            "блокировки или сна этого ПК." % (len(locked), locked[-1]["time"][11:19],
+                                              locked[-1]["gap"], locked[-1]["after"]))
     return data
 
 

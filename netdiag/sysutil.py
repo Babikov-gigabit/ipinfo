@@ -134,3 +134,20 @@ def attach_console():
             sys.stderr = sys.stdout
     except Exception:
         pass
+
+
+def idle_seconds():
+    """Сколько секунд не было ввода с клавиатуры и мыши на этом ПК (None вне Windows).
+
+    Ввод в окне RDP тоже считается: он идёт через этот ПК."""
+    if not IS_WINDOWS:
+        return None
+
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+    info = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+        return None
+    now = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
+    return ((now - info.dwTime) & 0xFFFFFFFF) / 1000.0
