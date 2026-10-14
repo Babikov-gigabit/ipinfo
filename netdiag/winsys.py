@@ -1,0 +1,466 @@
+# -*- coding: utf-8 -*-
+"""Сведения Windows: RDP, профили сетей, брандмауэр, Wi-Fi, системные команды.
+
+Всё читается без прав администратора.
+"""
+
+import ctypes
+import re
+
+from .sysutil import IS_WINDOWS, powershell_json, run
+
+# --------------------------------------------------------------------------
+# RDP
+# --------------------------------------------------------------------------
+_TS_KEY = r"SYSTEM\CurrentControlSet\Control\Terminal Server"
+_RDP_TCP_KEY = _TS_KEY + r"\WinStations\RDP-Tcp"
+_SERVICE_STATE = {1: "остановлена", 2: "запускается", 3: "останавливается",
+                  4: "работает", 5: "возобновляется", 6: "приостанавливается",
+                  7: "приостановлена"}
+# Редакции Windows без сервера RDP (к ним нельзя подключиться по RDP)
+HOME_EDITIONS = ("Core", "CoreN", "CoreSingleLanguage", "CoreCountrySpecific")
+
+
+def _reg(key, name):
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except Exception:
+        return None
+
+
+def _service_state(name):
+    """Состояние службы Windows через Service Control Manager (не зависит от языка)."""
+    class SERVICE_STATUS(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint32) for n in (
+            "dwServiceType", "dwCurrentState", "dwControlsAccepted", "dwWin32ExitCode",
+            "dwServiceSpecificExitCode", "dwCheckPoint", "dwWaitHint")]
+
+    adv = ctypes.windll.advapi32
+    adv.OpenSCManagerW.restype = ctypes.c_void_p
+    adv.OpenServiceW.restype = ctypes.c_void_p
+    adv.OpenServiceW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    adv.QueryServiceStatus.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    adv.CloseServiceHandle.argtypes = [ctypes.c_void_p]
+    scm = adv.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
+    if not scm:
+        return None
+    try:
+        svc = adv.OpenServiceW(scm, name, 0x0004)  # SERVICE_QUERY_STATUS
+        if not svc:
+            return None
+        try:
+            st = SERVICE_STATUS()
+            if not adv.QueryServiceStatus(svc, ctypes.byref(st)):
+                return None
+            return st.dwCurrentState
+        finally:
+            adv.CloseServiceHandle(svc)
+    finally:
+        adv.CloseServiceHandle(scm)
+
+
+def parse_listeners(netstat_out, port):
+    """Адреса, на которых слушается TCP-порт, из вывода `netstat -ano -p TCP`.
+
+    Состояние LISTENING на русской Windows называется иначе, поэтому
+    слушающие строки узнаём по удалённому адресу 0.0.0.0:0.
+    """
+    res = []
+    for line in netstat_out.splitlines():
+        p = line.split()
+        if len(p) >= 4 and p[0].upper() == "TCP" and p[2] in ("0.0.0.0:0", "[::]:0"):
+            host, _, lport = p[1].rpartition(":")
+            if lport == str(port):
+                res.append(host)
+    return res
+
+
+def rdp_info():
+    """Готов ли ПК принимать RDP. Только Windows."""
+    if not IS_WINDOWS:
+        return None
+    edition = _reg(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "EditionID")
+    deny = _reg(_TS_KEY, "fDenyTSConnections")
+    port = _reg(_RDP_TCP_KEY, "PortNumber") or 3389
+    nla = _reg(_RDP_TCP_KEY, "UserAuthentication")
+    try:
+        state = _service_state("TermService")
+    except Exception:
+        state = None
+    listen = parse_listeners(run(["netstat", "-ano", "-p", "TCP"]), port)
+    return {
+        "edition": edition,
+        "home_edition": edition in HOME_EDITIONS,
+        "enabled": deny == 0 if deny is not None else None,
+        "port": port,
+        "nla": bool(nla) if nla is not None else None,
+        "service_state": state,
+        "service_text": _SERVICE_STATE.get(state, "неизвестно"),
+        "listening_on": listen,
+    }
+
+
+# --------------------------------------------------------------------------
+# Профили сетей и брандмауэр (PowerShell, вывод в JSON)
+# --------------------------------------------------------------------------
+NET_CATEGORY = {0: "Общедоступная", 1: "Частная", 2: "Доменная"}
+_FW_PROFILE_BIT = {"Общедоступная": 4, "Частная": 2, "Доменная": 1}
+
+_PS_FIREWALL = r"""
+$r = @{}
+$r.profiles = @(Get-NetConnectionProfile | ForEach-Object {
+  @{ alias = $_.InterfaceAlias; index = $_.InterfaceIndex; name = $_.Name;
+     category = [int]$_.NetworkCategory; ipv4 = [int]$_.IPv4Connectivity } })
+$r.firewall = @(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {
+  @{ name = [string]$_.Name; enabled = [string]$_.Enabled;
+     inbound = [string]$_.DefaultInboundAction } })
+$r.rdp_rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Group '@FirewallAPI.dll,-28752' | ForEach-Object {
+  @{ name = $_.DisplayName; enabled = [string]$_.Enabled; profile = [int]$_.Profile;
+     direction = [string]$_.Direction; action = [string]$_.Action } })
+$r | ConvertTo-Json -Depth 4 -Compress
+"""
+
+
+def firewall_info():
+    """Профили сетей адаптеров, состояние брандмауэра и правила RDP."""
+    if not IS_WINDOWS:
+        return None
+    data = powershell_json(_PS_FIREWALL)
+    if not isinstance(data, dict):
+        return None
+    for p in data.get("profiles") or []:
+        p["category_text"] = NET_CATEGORY.get(p.get("category"), "?")
+    return data
+
+
+def rdp_allowed_for(category_text, fw):
+    """Разрешено ли входящее RDP правилами брандмауэра для профиля сети.
+
+    True / False, либо None, если правил прочитать не удалось.
+    """
+    if not fw or not fw.get("rdp_rules"):
+        return None
+    bit = _FW_PROFILE_BIT.get(category_text, 0)
+    for r in fw["rdp_rules"]:
+        if r.get("enabled") != "True" or r.get("direction") != "Inbound" \
+                or r.get("action") != "Allow":
+            continue
+        prof = r.get("profile") or 0
+        if prof == 0 or prof & bit:  # 0 = Any
+            return True
+    return False
+
+
+def firewall_enabled_for(category_text, fw):
+    names = {"Общедоступная": "Public", "Частная": "Private", "Доменная": "Domain"}
+    for p in (fw or {}).get("firewall") or []:
+        if p.get("name") == names.get(category_text):
+            return p.get("enabled") == "True"
+    return None
+
+
+# --------------------------------------------------------------------------
+# Wi-Fi
+# --------------------------------------------------------------------------
+def parse_wlan(out):
+    """Разбор `netsh wlan show interfaces` (русская и английская Windows)."""
+    res = {}
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key, val = key.strip(), val.strip()
+        k = key.lower()
+        if k == "ssid":
+            res["ssid"] = val
+        elif k == "bssid" or k == "ap bssid":
+            res["bssid"] = line.split(":", 1)[1].strip()
+        elif k in ("signal", "сигнал"):
+            m = re.match(r"(\d+)", val)
+            if m:
+                res["signal_pct"] = int(m.group(1))
+        elif k in ("channel", "канал"):
+            m = re.match(r"(\d+)", val)
+            if m:
+                res["channel"] = int(m.group(1))
+        elif k in ("radio type", "тип радио", "тип радиомодуля"):
+            res["radio"] = val
+        elif k in ("band", "диапазон"):
+            res["band"] = val
+        elif k.startswith("receive rate") or k.startswith("скорость приема") \
+                or k.startswith("скорость приёма"):
+            res["rx_mbps"] = val
+        elif k in ("state", "состояние"):
+            res.setdefault("state", val)
+    return res
+
+
+def wifi_info():
+    if IS_WINDOWS:
+        out = run(["netsh", "wlan", "show", "interfaces"])
+        info = parse_wlan(out)
+        return info if info.get("ssid") else None
+    return None
+
+
+# --------------------------------------------------------------------------
+# Сырые выводы системных команд для отчёта
+# --------------------------------------------------------------------------
+def system_dumps():
+    """Выводы стандартных команд: прикладываются к отчёту как есть."""
+    if IS_WINDOWS:
+        cmds = {
+            "ipconfig_all.txt": ["ipconfig", "/all"],
+            "route_print.txt": ["route", "print"],
+            "netsh_wlan_interfaces.txt": ["netsh", "wlan", "show", "interfaces"],
+            "netsh_winhttp_proxy.txt": ["netsh", "winhttp", "show", "proxy"],
+            "netstat_ano.txt": ["netstat", "-ano"],
+            "arp_a.txt": ["arp", "-a"],
+        }
+    else:
+        cmds = {
+            "ip_addr.txt": ["ip", "addr"],
+            "ip_route.txt": ["ip", "route"],
+            "resolv_conf.txt": ["cat", "/etc/resolv.conf"],
+        }
+    return {name: run(cmd, timeout=30) for name, cmd in cmds.items()}
+
+
+# --------------------------------------------------------------------------
+# Сетевые устройства в диспетчере устройств (в т.ч. отключённые и сломанные)
+# --------------------------------------------------------------------------
+# GetAdaptersAddresses не видит отключённые адаптеры и адаптеры с ошибкой
+# драйвера, а именно так выглядит «Виртуальный адаптер Континент 4 не найден».
+PNP_PROBLEM = {
+    1: "устройство настроено неправильно",
+    10: "устройство не может запуститься",
+    18: "нужно переустановить драйвер",
+    19: "повреждены настройки устройства в реестре",
+    21: "Windows удаляет устройство",
+    22: "адаптер отключён",
+    24: "устройство отсутствует или не работает",
+    28: "драйвер не установлен",
+    31: "Windows не может загрузить драйвер",
+    32: "служба драйвера отключена",
+    37: "драйвер не смог запуститься",
+    39: "драйвер повреждён или отсутствует",
+    43: "устройство сообщило о сбое",
+    45: "устройство сейчас не подключено (драйвер не загружен)",
+    48: "драйвер заблокирован",
+    52: "не удалось проверить цифровую подпись драйвера",
+}
+
+_PS_NET_DEVICES = r"""
+@(Get-PnpDevice -Class Net | ForEach-Object {
+  @{ name = $_.FriendlyName; description = $_.Description; status = [string]$_.Status;
+     problem = [int]$_.Problem; present = [bool]$_.Present; id = $_.InstanceId } }) |
+  ConvertTo-Json -Depth 3 -Compress
+"""
+
+
+def net_devices():
+    """Все сетевые устройства из диспетчера устройств с кодами ошибок. None вне Windows."""
+    if not IS_WINDOWS:
+        return None
+    data = powershell_json(_PS_NET_DEVICES)
+    if isinstance(data, dict):  # ConvertTo-Json отдаёт объект, если устройство одно
+        data = [data]
+    if not isinstance(data, list):
+        return None
+    for d in data:
+        code = d.get("problem") or 0
+        d["problem_text"] = PNP_PROBLEM.get(code, "ошибка устройства, код %d" % code) \
+            if code else ""
+    return data
+
+
+# --------------------------------------------------------------------------
+# Журнал клиента RDP (mstsc): подключения и обрывы с кодом причины
+# --------------------------------------------------------------------------
+RDP_CLIENT_LOG = "Microsoft-Windows-TerminalServices-RDPClient/Operational"
+# Коды причины отключения из события 1026 (самые частые)
+RDP_DISCONNECT_REASON = {
+    1: "отключено на этом ПК (пользователь закрыл окно)",
+    2: "отключено с удалённой стороны пользователем",
+    3: "сервер завершил сеанс (простой, ограничение времени или администратор)",
+    263: "служебное отключение при входе (проверка подлинности или переподключение); "
+         "обычно сеанс сразу продолжается",
+    264: "истекло время ожидания соединения",
+    516: "не удалось установить соединение с сервером",
+    2308: "соединение потеряно: связь с сервером прервалась (сокет закрыт)",
+    3334: "ошибка протокола RDP",
+}
+# коды 1026, которые не означают обрыв: закрыл пользователь или служебное
+# переподключение при входе (после 263 сеанс обычно сразу продолжается)
+RDP_NOT_DROP = (1, 2, 263)
+RDP_EVENT_TEXT = {
+    1024: "подключение к серверу",
+    1026: "отключение",
+    1027: "подключено к домену",
+    1029: "хэш имени пользователя",
+    1102: "запущено дополнительное UDP-соединение",
+    1103: "UDP-соединение установлено",
+    1105: "UDP-соединение разорвано",
+}
+
+_PS_RDP_EVENTS = r"""
+$start = (Get-Date).AddMinutes(-%d)
+@(Get-WinEvent -FilterHashtable @{LogName='%s'; StartTime=$start} -MaxEvents 500 |
+  Sort-Object TimeCreated | ForEach-Object {
+  @{ time = $_.TimeCreated.ToString('o'); id = $_.Id;
+     props = @($_.Properties | ForEach-Object { [string]$_.Value }) } }) |
+  ConvertTo-Json -Depth 4 -Compress
+"""
+
+
+def _event_value(props):
+    """Значение из полей события. У событий клиента RDP поля идут парами
+    «название, значение»: ["Disconnect Reason", "2308"], ["Server Name", "host"]."""
+    props = [p for p in props or [] if p not in (None, "")]
+    if len(props) >= 2 and not props[0].strip().lstrip("-").isdigit():
+        return props[1]
+    return props[0] if props else None
+
+
+def parse_rdp_event(e):
+    """Дополняет событие клиента RDP: text, для 1026 - reason/reason_text, для 1024 - server."""
+    e["text"] = RDP_EVENT_TEXT.get(e.get("id"), "событие %s" % e.get("id"))
+    value = _event_value(e.get("props"))
+    if e.get("id") == 1026 and value is not None:
+        try:
+            code = int(value)
+        except ValueError:
+            code = None
+        e["reason"] = code
+        e["reason_text"] = RDP_DISCONNECT_REASON.get(code, "код %s" % value)
+    elif e.get("id") == 1024 and value is not None:
+        e["server"] = value
+    return e
+
+
+def rdp_client_events(minutes=60):
+    """События клиента RDP за последние minutes минут. [] если нет, None вне Windows."""
+    if not IS_WINDOWS:
+        return None
+    data = powershell_json(_PS_RDP_EVENTS % (int(minutes), RDP_CLIENT_LOG))
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    for e in data:
+        parse_rdp_event(e)
+    return data
+
+
+# --------------------------------------------------------------------------
+# Активные TCP-соединения и host-маршруты: к какому IP подключён VPN-клиент
+# --------------------------------------------------------------------------
+_PS_LINKS = r"""
+$r = @{}
+$r.tcp = @(Get-NetTCPConnection -State Established,SynSent -ErrorAction SilentlyContinue |
+  ForEach-Object {
+  @{ remote = [string]$_.RemoteAddress; rport = [int]$_.RemotePort;
+     local = [string]$_.LocalAddress; procid = [int]$_.OwningProcess;
+     state = [string]$_.State; created = $_.CreationTime.ToString('o') } })
+$r.procs = @{}
+foreach ($i in ($r.tcp | ForEach-Object { $_.procid } | Sort-Object -Unique)) {
+  $p = Get-Process -Id $i -ErrorAction SilentlyContinue
+  if ($p) { $r.procs[[string]$i] = $p.ProcessName + '|' + [string]$p.Path } }
+$r.routes = @(Get-NetRoute -AddressFamily IPv4 | Where-Object { $_.DestinationPrefix -like '*/32' } |
+  ForEach-Object { @{ prefix = [string]$_.DestinationPrefix; ifindex = [int]$_.InterfaceIndex;
+                      nexthop = [string]$_.NextHop } })
+$r | ConvertTo-Json -Depth 4 -Compress
+"""
+
+
+def network_links():
+    """Установленные TCP-соединения (с именем процесса) и маршруты /32. None вне Windows."""
+    if not IS_WINDOWS:
+        return None
+    data = powershell_json(_PS_LINKS)
+    if not isinstance(data, dict):
+        return None
+    procs = data.get("procs") or {}
+    tcp = data.get("tcp") or []
+    if isinstance(tcp, dict):
+        tcp = [tcp]
+    for c in tcp:
+        name, _, path = procs.get(str(c.get("procid")), "").partition("|")
+        c["process"], c["path"] = name, path
+    routes = data.get("routes") or []
+    if isinstance(routes, dict):
+        routes = [routes]
+    return {"tcp": tcp, "routes": routes}
+
+
+# процессы-прокси: их соединения - это чужой трафик (в том числе наши же проверки),
+# проходящий через другой VPN, а не подключение VPN-клиента
+PROXY_PROCS = ("sing-box", "happ", "xray", "v2ray", "clash", "mihomo", "hiddify", "nekobox",
+               "nekoray", "outline", "amnezia", "wireguard", "tun2socks", "ipinfo")
+
+
+def _proc_matches(c, words):
+    text = ("%s %s" % (c.get("process") or "", c.get("path") or "")).lower()
+    return any(w.lower() in text for w in words if w)
+
+
+def client_links(links, client_patterns, other_patterns=()):
+    """TCP-соединения самого VPN-клиента (по имени процесса и пути к программе)
+    и соединения процессов-прокси других VPN."""
+    res = {"client": [], "proxy": []}
+    for c in (links or {}).get("tcp", []):
+        if _proc_matches(c, PROXY_PROCS + tuple(other_patterns)):
+            res["proxy"].append(c)
+        elif _proc_matches(c, client_patterns):
+            res["client"].append(c)
+    return res
+
+
+def server_links(links, ips, port=None):
+    """Какие из адресов сервера реально используются.
+
+    tcp - установленные соединения на эти адреса (и порт, если задан);
+    routes - отдельные маршруты /32 на эти адреса: VPN-клиенты ставят их,
+    чтобы трафик к своему серверу не уходил в туннель (видно и при UDP).
+    """
+    res = {"tcp": [], "routes": []}
+    if not links:
+        return res
+    ipset = set(ips)
+    for c in links.get("tcp", []):
+        if _proc_matches(c, PROXY_PROCS) or c.get("state", "Established") != "Established":
+            continue  # через прокси другого VPN идут и наши собственные проверки
+        if c.get("remote") in ipset and (port is None or c.get("rport") == port):
+            res["tcp"].append(c)
+    for r in links.get("routes", []):
+        ip = (r.get("prefix") or "").split("/")[0]
+        if ip in ipset:
+            res["routes"].append(dict(r, ip=ip))
+    return res
+
+
+# --------------------------------------------------------------------------
+# Системный прокси Windows (его берёт Континент при «Автоматически
+# определять настройки прокси»; Happ и подобные любят его включать)
+# --------------------------------------------------------------------------
+def system_proxy():
+    """{'enabled', 'server', 'pac'} из настроек пользователя или None вне Windows."""
+    if not IS_WINDOWS:
+        return None
+    import winreg
+    res = {"enabled": False, "server": "", "pac": ""}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as k:
+            for name, key in (("enabled", "ProxyEnable"), ("server", "ProxyServer"),
+                              ("pac", "AutoConfigURL")):
+                try:
+                    res[name] = winreg.QueryValueEx(k, key)[0]
+                except OSError:
+                    pass
+    except OSError:
+        return None
+    res["enabled"] = bool(res["enabled"])
+    return res

@@ -1,0 +1,79 @@
+name: Сборка IPInfo.exe
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Выпустить релиз (версия из netdiag/__init__.py, описание из RELEASE_NOTES.md)"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Тесты
+        run: python -m unittest discover tests -v
+
+      - name: PyInstaller
+        run: python -m pip install pyinstaller
+
+      - name: Сборка exe
+        run: >
+          python -m PyInstaller --onefile --windowed --noupx --clean --noconfirm
+          --name IPInfo --icon ip-icon.ico --add-data "ip-icon.ico;."
+          --version-file version.txt
+          --exclude-module numpy --exclude-module pandas --exclude-module PIL
+          --exclude-module unittest --exclude-module pydoc --exclude-module doctest
+          ipinfo.py
+
+      - name: Проверка запуска
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\IPInfo.exe -ArgumentList '--json','--no-net' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "IPInfo.exe завершился с кодом $($p.ExitCode)" }
+          (Get-FileHash dist\IPInfo.exe -Algorithm SHA256).Hash | Tee-Object dist\IPInfo.exe.sha256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPInfo
+          path: |
+            dist/IPInfo.exe
+            dist/IPInfo.exe.sha256.txt
+
+      # Ручной запуск кладёт exe в ветку test-build: оттуда его можно забрать
+      # через git, без доступа к хранилищу артефактов Actions.
+      - name: Публикация в ветку test-build
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          $sha = git rev-parse --short HEAD
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item dist\IPInfo.exe, dist\IPInfo.exe.sha256.txt out\
+          Set-Location out
+          git init -q -b test-build
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -q -m "IPInfo.exe из $sha"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" test-build
+
+      - name: Релиз
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $v = (Select-String -Path netdiag\__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
+          gh release create "v$v" dist\IPInfo.exe dist\IPInfo.exe.sha256.txt --target $env:GITHUB_SHA --title "IPInfo $v" --notes-file RELEASE_NOTES.md
