@@ -274,10 +274,10 @@ class DiagnoseTest(unittest.TestCase):
 
     def test_internal_defaults_to_tunnel_dns(self):
         self.cfg["internal"] = []
-        vpn = dict(self.vpn, dns=["10.61.30.91", "78.88.8.8"])
+        vpn = dict(self.vpn, dns=["10.20.30.91", "78.88.8.8"])
         d = self.run_diag([self.lan, vpn])
         names = [c["name"] for c in d["checks"] if c["group"] == "Туннель"]
-        self.assertIn("DNS туннеля (10.61.30.91)", names)
+        self.assertIn("DNS туннеля (10.20.30.91)", names)
         self.assertNotIn("DNS туннеля (78.88.8.8)", names)
 
     def test_rdp_outbound_targets(self):
@@ -531,46 +531,46 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(live.rdp_transport(None, udp_socket=False)[0], "TCP")
 
     def test_read_rows(self):
-        lan = adapter("Wi-Fi", ["192.168.100.5/24"], gateway=["192.168.100.12"], index=5)
-        vpn = adapter("Подключение по локальной сети", ["10.61.207.130/32"], iftype=53, index=9,
+        lan = adapter("Wi-Fi", ["192.168.1.5/24"], gateway=["192.168.1.1"], index=5)
+        vpn = adapter("Подключение по локальной сети", ["10.20.30.130/32"], iftype=53, index=9,
                       desc="Continent TLS Adapter")
         happ = adapter("happ-tun", ["172.19.0.1/30"], iftype=53, index=12, desc="sing-box TUN")
-        conns = [{"remote": "10.61.220.15", "rport": 3389, "lport": 50000, "pid": 7,
+        conns = [{"remote": "10.20.1.15", "rport": 3389, "lport": 50000, "pid": 7,
                   "process": "mstsc"},
                  {"remote": "127.0.0.1", "rport": 10808, "lport": 50001, "pid": 8,
                   "process": "VpnService",
                   "path": r"C:\Program Files\Security Code\Continent ZTN Client\VpnService.exe"}]
         info = live.Info(self.cfg)
-        info.ext = ("178.176.250.130", 1000)
+        info.ext = ("203.0.113.50", 1000)
         evs = [{"id": 1024, "time": "2026-10-14T13:00:00"}, {"id": 1103, "time": "2026-10-14T13:00:02"}]
         with mock.patch.object(winsys, "rdp_client_events", return_value=evs):
             rows, key = info.read([lan, vpn, happ], conns, udp={7}, now=1030)
         d = {r[0]: (r[1], r[2]) for r in rows}
         self.assertEqual(d["VPN"][0], "подключён: Континент, через локальный прокси "
                                       "127.0.0.1:10808")
-        info.vpn_ips = {"109.70.24.115"}
-        conns.append({"remote": "109.70.24.115", "rport": 443, "lport": 50002, "pid": 9,
+        info.vpn_ips = {"198.51.100.20"}
+        conns.append({"remote": "198.51.100.20", "rport": 443, "lport": 50002, "pid": 9,
                       "process": "sing-box"})
         rows2, _ = info.read([lan, vpn, happ], conns, udp={7}, now=1030)
-        self.assertEqual(rows2[0][1], "подключён: Континент, сервер 109.70.24.115:443 "
+        self.assertEqual(rows2[0][1], "подключён: Континент, сервер 198.51.100.20:443 "
                                       "через прокси sing-box")
         self.assertIn("happ-tun", d["Другой VPN"][0])
-        self.assertTrue(d["Внутренний IP"][0].startswith("10.61.207.130"))
-        self.assertTrue(d["Локальный IP"][0].startswith("192.168.100.5"))
-        self.assertEqual(d["Внешний IP"][0], "178.176.250.130  (проверен 30 с назад)")
-        self.assertEqual(d["RDP"], ("подключён к 10.61.220.15:3389 (mstsc, 0 с)", "ok"))
+        self.assertTrue(d["Внутренний IP"][0].startswith("10.20.30.130"))
+        self.assertTrue(d["Локальный IP"][0].startswith("192.168.1.5"))
+        self.assertEqual(d["Внешний IP"][0], "203.0.113.50  (проверен 30 с назад)")
+        self.assertEqual(d["RDP"], ("подключён к 10.20.1.15:3389 (mstsc, 0 с)", "ok"))
         self.assertTrue(d["Протокол RDP"][0].startswith("UDP"))
         self.assertFalse(info.want_external(key, 1031) and info.ext_key == key)
 
 
 class SessionTest(unittest.TestCase):
     EVS = [
-        {"time": "2026-10-14T12:00:00.1+03:00", "id": 21, "props": ["CORP\\ivan", "2", "10.61.30.91"]},
+        {"time": "2026-10-14T12:00:00.1+03:00", "id": 21, "props": ["CORP\\ivan", "2", "10.20.30.91"]},
         {"time": "2026-10-14T12:15:00.1+03:00", "id": 4800, "props": []},
-        {"time": "2026-10-14T12:15:40.1+03:00", "id": 24, "props": ["CORP\\ivan", "2", "10.61.30.91"]},
+        {"time": "2026-10-14T12:15:40.1+03:00", "id": 24, "props": ["CORP\\ivan", "2", "10.20.30.91"]},
         {"time": "2026-10-14T12:15:40.2+03:00", "id": 40, "props": ["2", "0"]},
         {"time": "2026-10-14T13:00:00.1+03:00", "id": 24, "props": ["CORP\\ivan", "3", "LOCAL"]},
-        {"time": "2026-10-14T14:00:00.1+03:00", "id": 24, "props": ["CORP\\ivan", "2", "10.61.30.91"]},
+        {"time": "2026-10-14T14:00:00.1+03:00", "id": 24, "props": ["CORP\\ivan", "2", "10.20.30.91"]},
         {"time": "2026-10-14T14:00:00.2+03:00", "id": 40, "props": ["2", "3"]},
     ]
 
@@ -734,14 +734,14 @@ class MonitorTest(unittest.TestCase):
         evs = [{"time": None, "id": 1105, "props": []},
                {"time": None, "id": 1026, "props": ["263"], "reason": 263,
                 "reason_text": winsys.RDP_DISCONNECT_REASON[263]}]
-        conn = {"remote": "10.61.220.15", "rport": 3389, "lport": 50000, "pid": 7,
+        conn = {"remote": "10.20.1.15", "rport": 3389, "lport": 50000, "pid": 7,
                 "process": "mstsc", "state": "established"}
         with mock.patch.object(winsys, "rdp_client_events", return_value=evs), \
                 mock.patch.object(monitor.ad, "tcp_connections", return_value=[conn]):
             self.m._check_rdp_log(set())
         self.assertEqual([e["level"] for e in self.events], ["info", "info"])
         self.assertIn("Сеанс продолжается", self.events[-1]["text"])
-        self.assertIn("mstsc → 10.61.220.15:3389", self.events[-1]["text"])
+        self.assertIn("mstsc → 10.20.1.15:3389", self.events[-1]["text"])
 
     @unittest.skipUnless(sysutil.IS_WINDOWS, "только Windows")
     def test_tcp_connections_windows(self):
@@ -774,7 +774,7 @@ class MonitorTest(unittest.TestCase):
 
     def test_rdp_tcp_watch_and_disconnect_details(self):
         B = 1760000000  # реальное время: на Windows timestamp() около 1970 года падает
-        conn = {"remote": "10.61.220.15", "rport": 3389, "lport": 50000, "pid": 7,
+        conn = {"remote": "10.20.1.15", "rport": 3389, "lport": 50000, "pid": 7,
                 "process": "mstsc"}
         other = {"remote": "1.1.1.1", "rport": 443, "lport": 50001, "pid": 8,
                  "process": "chrome"}
@@ -784,7 +784,7 @@ class MonitorTest(unittest.TestCase):
             self.m._check_rdp_tcp(B + 1002)
             self.assertEqual(self.m._check_rdp_tcp(B + 1004), 0)
         self.assertIn("закрыто", self.events[-1]["text"])
-        self.m.rdp_session = {"server": "10.61.220.15", "t": B + 400}
+        self.m.rdp_session = {"server": "10.20.1.15", "t": B + 400}
         self.m.rdp_udp_lost = B + 990
         self.m.history.append({"t": B + 1000, "probes": {}, "tunnel": True, "other_vpn": []})
         with mock.patch.object(self.m, "_route_of", return_value="Continent"):
@@ -793,7 +793,7 @@ class MonitorTest(unittest.TestCase):
                                                    B + 1005).isoformat()})
         self.assertIn("длился 10 мин 5 с", text)
         self.assertIn("UDP-канал RDP разорвался", text)
-        self.assertIn("TCP-соединение mstsc → 10.61.220.15:3389 закрылось", text)
+        self.assertIn("TCP-соединение mstsc → 10.20.1.15:3389 закрылось", text)
         self.assertIn("через «Continent»", text)
         self.assertIn("по неактивности", text)
 

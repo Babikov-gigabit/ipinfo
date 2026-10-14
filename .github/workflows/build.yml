@@ -5,6 +5,11 @@ on:
     branches: [main, "claude/**"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Выпустить релиз (версия из netdiag/__init__.py, описание из RELEASE_NOTES.md)"
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -63,3 +68,12 @@ jobs:
           git add -A
           git commit -q -m "IPInfo.exe из $sha"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" test-build
+
+      - name: Релиз
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $v = (Select-String -Path netdiag\__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
+          gh release create "v$v" dist\IPInfo.exe dist\IPInfo.exe.sha256.txt --target $env:GITHUB_SHA --title "IPInfo $v" --notes-file RELEASE_NOTES.md
