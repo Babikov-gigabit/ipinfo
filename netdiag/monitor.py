@@ -434,15 +434,39 @@ class Monitor:
                 self.emit("info", "RDP %s: подключение к %s" % (_hms(at), e.get("server", "?")),
                           rdp=e)
             elif e["id"] == 1026:
+                alive = self._rdp_alive(at)
+                if alive:
+                    # клиент пишет 1026 и при служебных переподключениях (код 263 при
+                    # входе): если соединение с сервером открыто и сейчас, сеанс идёт
+                    self.emit("info", "RDP %s: служебное событие отключения (код %s: %s). "
+                              "Сеанс продолжается: соединение %s открыто." % (
+                                  _hms(at), e.get("reason"), e.get("reason_text"), alive),
+                              rdp=e, benign=True)
+                    continue
                 cause = self.describe_disconnect(e)
-                self.emit("fail" if e.get("reason") not in (1, 2) else "info",
+                self.emit("fail" if e.get("reason") not in winsys.RDP_NOT_DROP else "info",
                           "RDP %s: сеанс отключён - %s (код %s).\n%s" % (
                               _hms(at), e.get("reason_text"), e.get("reason"), cause),
                           rdp=e, cause=cause)
             elif e["id"] == 1105:
                 self.rdp_udp_lost = at
-                self.emit("warn", "RDP %s: UDP-канал разорван, сеанс перешёл на TCP" % _hms(at),
-                          rdp=e)
+                alive = self._rdp_alive(at)
+                if alive:
+                    self.emit("info", "RDP %s: UDP-канал закрыт, сеанс работает по TCP "
+                              "(соединение %s открыто)" % (_hms(at), alive), rdp=e)
+                else:
+                    self.emit("warn", "RDP %s: UDP-канал разорван, сеанс перешёл на TCP"
+                              % _hms(at), rdp=e)
+
+    def _rdp_alive(self, at):
+        """Открытое сейчас TCP-соединение клиента RDP: 'mstsc → ip:port' или None."""
+        conns = ad.tcp_connections()
+        if conns is None:
+            return None
+        for c in conns:
+            if c.get("state", "established") == "established" and self._is_rdp_conn(c):
+                return "%s → %s:%d" % (c.get("process") or "RDP", c["remote"], c["rport"])
+        return None
 
     # ---- TCP-соединения клиента RDP ------------------------------------------
     def _is_rdp_conn(self, c):

@@ -670,7 +670,8 @@ def run(cfg, progress=None):
             rdp_out_fail.append(label)
             rep.add(G, label, FAIL, "%s%s" % (r["tcp"], route), **r)
     rdp_log = f_rdplog.result()
-    drops = [e for e in rdp_log or [] if e.get("id") == 1026 and e.get("reason") not in (1, 2)]
+    drops = [e for e in rdp_log or [] if e.get("id") == 1026
+             and e.get("reason") not in winsys.RDP_NOT_DROP]
     if drops:
         by_reason = collections.Counter(e.get("reason_text") for e in drops)
         rep.add(G, "Обрывы за сутки", WARN, "%d: %s; последний %s" % (

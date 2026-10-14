@@ -606,6 +606,19 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("сеанс отключён", self.events[-1]["text"])
         self.assertIn("2308", self.events[-1]["text"])
 
+    def test_rdp_disconnect_while_session_alive_is_not_error(self):
+        evs = [{"time": None, "id": 1105, "props": []},
+               {"time": None, "id": 1026, "props": ["263"], "reason": 263,
+                "reason_text": winsys.RDP_DISCONNECT_REASON[263]}]
+        conn = {"remote": "10.61.220.15", "rport": 3389, "lport": 50000, "pid": 7,
+                "process": "mstsc", "state": "established"}
+        with mock.patch.object(winsys, "rdp_client_events", return_value=evs), \
+                mock.patch.object(monitor.ad, "tcp_connections", return_value=[conn]):
+            self.m._check_rdp_log(set())
+        self.assertEqual([e["level"] for e in self.events], ["info", "info"])
+        self.assertIn("Сеанс продолжается", self.events[-1]["text"])
+        self.assertIn("mstsc → 10.61.220.15:3389", self.events[-1]["text"])
+
     @unittest.skipUnless(sysutil.IS_WINDOWS, "только Windows")
     def test_tcp_connections_windows(self):
         conns = monitor.ad.tcp_connections()
