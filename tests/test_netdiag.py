@@ -440,6 +440,31 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("vpn_logs/continent/a.log", names)
         self.assertIn("system/x.txt", names)
 
+    def test_readable_report_in_folder(self):
+        d = self.run_diag([self.lan, self.vpn])
+        events = [{"time": "2026-10-14T10:00:00", "level": "fail",
+                   "text": "туннель «Continent» пропал\n    подробности"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "Отчёты")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "Мониторинг 2026-10-14 09-00.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("10:00:00 XX туннель пропал\n")
+            with mock.patch.object(winsys, "system_dumps", return_value={}), \
+                    mock.patch("netdiag.report.data_dir", return_value=tmp):
+                path = report.build_zip(d, self.cfg, folder=folder, events=events,
+                                        monitor_summary="мониторинг 5 мин")
+            import zipfile
+            names = zipfile.ZipFile(path).namelist()
+            self.assertTrue(os.path.basename(path).startswith("Отчёт "))
+            with open(path[:-4] + ".html", encoding="utf-8") as f:
+                page = f.read()
+        self.assertIn("Отчёт.html", names)
+        self.assertIn("мониторинг/Мониторинг 2026-10-14 09-00.txt", names)
+        self.assertIn("Итог", page)
+        self.assertIn("туннель «Continent» пропал<br>", page)
+        self.assertIn("мониторинг 5 мин", page)
+
 
 class MonitorTest(unittest.TestCase):
     def setUp(self):

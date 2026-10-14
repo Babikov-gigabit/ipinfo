@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Общие системные функции: пути, запуск команд, PowerShell."""
 
+import ctypes
 import json
 import os
 import platform
@@ -35,6 +36,34 @@ def data_dir():
     else:
         path = os.path.join(os.path.expanduser("~"), ".ipinfo")
     os.makedirs(path, exist_ok=True)
+    return path
+
+
+def documents_dir():
+    """Папка «Документы» пользователя (учитывает перенос в OneDrive)."""
+    if IS_WINDOWS:
+        try:
+            buf = ctypes.create_unicode_buffer(260)
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 and buf.value:
+                return buf.value
+        except Exception:
+            pass
+    home = os.path.expanduser("~")
+    docs = os.path.join(home, "Documents")
+    return docs if os.path.isdir(docs) else home
+
+
+REPORT_FOLDER_NAME = "IPInfo отчёты"
+
+
+def reports_folder(custom=""):
+    """Папка для пользователя: журнал мониторинга, проверки и отчёты."""
+    path = custom or os.path.join(documents_dir(), REPORT_FOLDER_NAME)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        path = os.path.join(data_dir(), "reports")
+        os.makedirs(path, exist_ok=True)
     return path
 
 

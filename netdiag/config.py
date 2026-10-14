@@ -48,6 +48,13 @@ incoming = no
 ; Для входящего RDP: сети администраторов, ответы в которые должны идти в туннель.
 ; sources = 10.1.2.0/24
 
+[report]
+; Папка, куда программа сама складывает журнал мониторинга, результаты проверок
+; и собранные отчёты. Пусто - "Документы\\IPInfo отчёты".
+folder =
+; Запускать мониторинг сразу при открытии программы (yes/no).
+autostart = yes
+
 [logs]
 ; Папки или файлы с журналами VPN-клиентов, которые добавятся в отчёт.
 ; Можно использовать %ProgramData%, %LOCALAPPDATA% и маски *.log.
@@ -143,4 +150,6 @@ def load(path=None):
         "rdp_targets": [_rdp_target(t) for t in _split(cp.get("rdp", "targets", fallback=""))],
         "rdp_sources": _split(cp.get("rdp", "sources", fallback="")),
         "logs": {n: os.path.expandvars(v.strip()) for n, v in cp.items("logs") if v.strip()},
+        "report_folder": os.path.expandvars(cp.get("report", "folder", fallback="").strip()),
+        "autostart": cp.getboolean("report", "autostart", fallback=True),
     }

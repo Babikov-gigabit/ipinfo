@@ -95,6 +95,89 @@ def format_text(data):
     return "\n".join(out) + "\n"
 
 
+STATUS_RU = {"ok": ("норма", "#1a7f37", "#e6f4ea"), "warn": ("внимание", "#9a6700", "#fff4d6"),
+             "fail": ("ошибка", "#c62828", "#fde7e7"), "info": ("сведения", "#57606a", "#f0f2f4")}
+
+
+def _esc(text):
+    import html
+    return html.escape(str(text if text is not None else ""))
+
+
+def format_html(data, events=None, monitor_summary=None):
+    """Отчёт для человека: открывается в браузере, сверху - итог простыми словами."""
+    checks = data.get("checks", [])
+    counts = {k: sum(1 for c in checks if c["status"] == k) for k in STATUS_RU}
+    bad = counts["fail"] > 0
+    out = ["<!doctype html><html lang='ru'><head><meta charset='utf-8'>",
+           "<title>Отчёт о сети - %s</title>" % _esc(data.get("host")),
+           "<style>body{font:15px/1.5 'Segoe UI',Arial,sans-serif;margin:0;background:#f6f7f9;"
+           "color:#1f2328}main{max-width:900px;margin:0 auto;padding:24px}"
+           "h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 8px}"
+           ".meta{color:#57606a;font-size:13px}.box{background:#fff;border-radius:10px;"
+           "padding:16px 20px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}"
+           ".verdict li{margin:6px 0;font-size:16px}table{width:100%;border-collapse:collapse}"
+           "td{padding:7px 8px;border-top:1px solid #eaecef;vertical-align:top}"
+           ".st{white-space:nowrap;font-size:12px;font-weight:600;border-radius:10px;"
+           "padding:2px 8px}.n{white-space:nowrap;color:#57606a}.ev td{font-size:13px}"
+           ".big{font-size:18px;font-weight:600}table{table-layout:fixed}.c1{width:90px}"
+           ".n{width:210px}</style></head><body><main>",
+           "<h1>Отчёт о сети и VPN</h1>",
+           "<div class='meta'>Компьютер: <b>%s</b> · %s · %s · IPInfo %s</div>" % (
+               _esc(data.get("host")), _esc(data.get("time")), _esc(data.get("os")),
+               _esc(data.get("version", __version__))),
+           "<div class='box'><div class='big' style='color:%s'>%s</div>" % (
+               "#c62828" if bad else "#1a7f37",
+               "Найдены проблемы" if bad else "Серьёзных проблем не найдено"),
+           "<div class='meta'>Ошибок: %d · предупреждений: %d · в норме: %d</div>" % (
+               counts["fail"], counts["warn"], counts["ok"]),
+           "<h2>Итог</h2><ul class='verdict'>"]
+    out += ["<li>%s</li>" % _esc(v) for v in data.get("verdict", [])]
+    out.append("</ul></div>")
+    if events is not None:
+        bad_ev = [e for e in events if e.get("level") in ("warn", "fail")]
+        out.append("<div class='box'><h2 style='margin-top:0'>Мониторинг: что пропадало</h2>")
+        if monitor_summary:
+            out.append("<div class='meta'>%s</div>" % _esc(monitor_summary))
+        if bad_ev:
+            out.append("<table class='ev'>")
+            for e in bad_ev[-200:]:
+                label, fg, bg = STATUS_RU.get(e["level"], STATUS_RU["info"])
+                out.append("<tr><td class='n'>%s</td><td class='c1'><span class='st' style='color:%s;"
+                           "background:%s'>%s</span></td><td>%s</td></tr>" % (
+                               _esc(e["time"].replace("T", " ")), fg, bg, label,
+                               _esc(e["text"]).replace("\n", "<br>")))
+            out.append("</table>")
+        else:
+            out.append("<p>За время мониторинга обрывов не было.</p>")
+        out.append("</div>")
+    group = None
+    for c in checks:
+        if c["group"] != group:
+            if group is not None:
+                out.append("</table></div>")
+            group = c["group"]
+            out.append("<div class='box'><h2 style='margin-top:0'>%s</h2><table>" % _esc(group))
+        label, fg, bg = STATUS_RU.get(c["status"], STATUS_RU["info"])
+        out.append("<tr><td class='c1'><span class='st' style='color:%s;background:%s'>%s</span></td>"
+                   "<td class='n'>%s</td><td>%s</td></tr>" % (
+                       fg, bg, label, _esc(c["name"]), _esc(c["summary"])))
+    if group is not None:
+        out.append("</table></div>")
+    out.append("<div class='box'><h2 style='margin-top:0'>Сетевые адаптеры</h2><table>")
+    for a in data.get("adapters", []):
+        if a.get("loopback"):
+            continue
+        out.append("<tr><td><b>%s</b><br><span class='meta'>%s</span></td><td>%s</td>"
+                   "<td class='meta'>шлюз %s<br>DNS %s</td></tr>" % (
+                       _esc(a["name"]), _esc(a["description"]),
+                       _esc(", ".join(a["ipv4"]) or a["status"]),
+                       _esc(", ".join(a["gateway"]) or "-"), _esc(", ".join(a["dns"]) or "-")))
+    out.append("</table></div><p class='meta'>Этот файл входит в zip-отчёт. Для разбора "
+               "проблемы отправьте zip-файл целиком.</p></main></body></html>")
+    return "\n".join(out)
+
+
 def _add_vpn_logs(z, logs_cfg):
     """Добавляет журналы VPN-клиентов из раздела [logs]. Возвращает список заметок."""
     notes = []
@@ -149,15 +232,28 @@ def _add_continent(z):
     return notes
 
 
-def build_zip(data, cfg, path=None):
+def build_zip(data, cfg, path=None, folder=None, events=None, monitor_summary=None):
     """Собирает отчёт в zip: проверка, журналы, системные выводы, логи VPN.
 
-    Возвращает путь к файлу.
+    folder - папка отчётов: туда кладётся zip и рядом «Отчёт ....html» для чтения,
+    а из неё берутся журналы мониторинга за последние 3 дня.
+    Возвращает путь к zip.
     """
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    human = datetime.datetime.now().strftime("%Y-%m-%d %H-%M")
     host = "".join(ch for ch in socket.gethostname() if ch.isalnum() or ch in "-_") or "pc"
+    if not path and folder:
+        path = os.path.join(folder, "Отчёт %s %s.zip" % (host, human))
     path = path or os.path.join(reports_dir(), "ipinfo-%s-%s.zip" % (host, stamp))
+    page = format_html(data, events, monitor_summary)
+    if folder:
+        try:
+            with open(path[:-4] + ".html", "w", encoding="utf-8") as f:
+                f.write(page)
+        except OSError as e:
+            log.warning("не удалось сохранить html-отчёт: %s", e)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("Отчёт.html", page)
         z.writestr("report.txt", format_text(data))
         z.writestr("report.json", json.dumps(data, ensure_ascii=False, indent=2, default=str))
         for name, text in winsys.system_dumps().items():
@@ -171,6 +267,11 @@ def build_zip(data, cfg, path=None):
         for f in sorted(glob.glob(os.path.join(logs_dir(), "*"))):
             if os.path.isfile(f):
                 z.write(f, "ipinfo_logs/" + os.path.basename(f))
+        if folder:
+            import time as _time
+            for f in glob.glob(os.path.join(folder, "Мониторинг *.txt")):
+                if _time.time() - os.path.getmtime(f) < 3 * 86400:
+                    z.write(f, "мониторинг/" + os.path.basename(f))
         notes = _add_vpn_logs(z, cfg.get("logs", {}))
         notes += _add_continent(z)
         info = ["IPInfo %s" % __version__, "Собран: %s" % stamp,

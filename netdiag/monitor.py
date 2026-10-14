@@ -69,7 +69,7 @@ class Probe:
 
 
 class Monitor:
-    def __init__(self, cfg, interval=2.0, on_event=None):
+    def __init__(self, cfg, interval=2.0, on_event=None, out_dir=None):
         self.cfg = cfg
         self.interval = max(1.0, float(interval))
         self.on_event = on_event
@@ -91,7 +91,10 @@ class Monitor:
         self.rdp_session = None  # {"server", "t"} - последнее подключение по журналу
         self.rdp_udp_lost = None  # время последнего разрыва UDP-канала RDP
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.text_path = os.path.join(logs_dir(), "monitor-%s.log" % stamp)
+        # текстовый журнал - для человека, его можно класть в папку отчётов
+        self.text_path = os.path.join(out_dir, "Мониторинг %s.txt" % datetime.datetime.now()
+                                      .strftime("%Y-%m-%d %H-%M")) if out_dir else \
+            os.path.join(logs_dir(), "monitor-%s.log" % stamp)
         self.json_path = os.path.join(logs_dir(), "monitor-%s.jsonl" % stamp)
 
     # ---- запись -----------------------------------------------------------

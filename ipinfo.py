@@ -18,13 +18,14 @@ ipinfo - сетевые адаптеры и диагностика VPN (Конт
 
 import argparse
 import json
+import os
 import queue
 import sys
 import threading
 import traceback
 
 from netdiag import __version__, adapters as ad, config, diagnose, monitor, probes, report
-from netdiag.sysutil import attach_console, resource_path
+from netdiag.sysutil import attach_console, reports_folder, resource_path
 
 ICON_NAME = "ip-icon.ico"
 log = report.log
@@ -114,6 +115,9 @@ FG_WARN = "#d97706"
 FG_FAIL = "#dc2626"
 FG_OK = "#16a34a"
 STATUS_COLOR = {"ok": FG_OK, "warn": FG_WARN, "fail": FG_FAIL, "info": FG_MUTED}
+ACCENT = "#2563eb"      # кнопка «Собрать отчёт»
+ACCENT_HOVER = "#1d4ed8"
+PANEL_W = 620           # ширина выезжающей справа панели
 
 
 def run_gui(include_down, want_external, cfg_path=None):
@@ -123,8 +127,11 @@ def run_gui(include_down, want_external, cfg_path=None):
     root = tk.Tk()
     root.title("IP")
     root.configure(bg=BG)
-    root.geometry("400x520")
+    root.geometry("400x560")
     root.minsize(340, 300)
+    cfg_file = cfg_path or config.ensure_config()
+    cfg = config.load(cfg_file)
+    folder = reports_folder(cfg.get("report_folder"))
     try:
         root.iconbitmap(resource_path(ICON_NAME))
     except Exception:
@@ -167,8 +174,12 @@ def run_gui(include_down, want_external, cfg_path=None):
 
     state = {"toast": None, "gen": 0}
 
+    # Слева - адаптеры, справа - выезжающая панель проверки и мониторинга
+    left = tk.Frame(root, bg=BG)
+    left.pack(side="left", fill="both", expand=True)
+
     # --- шапка ---------------------------------------------------------
-    head = tk.Frame(root, bg=BG)
+    head = tk.Frame(left, bg=BG)
     head.pack(fill="x", padx=22, pady=(18, 6))
 
     tk.Label(head, text="СЕТЬ", font=(family, 8, "bold"), fg=FG_MUTED, bg=BG).pack(side="left")
@@ -185,7 +196,7 @@ def run_gui(include_down, want_external, cfg_path=None):
     monitor_btn = head_button("МОНИТОРИНГ")
 
     # --- прокручиваемая область ----------------------------------------
-    canvas = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0)
+    canvas = tk.Canvas(left, bg=BG, highlightthickness=0, bd=0)
     body = tk.Frame(canvas, bg=BG)
     win = canvas.create_window((0, 0), window=body, anchor="nw")
 
@@ -205,10 +216,21 @@ def run_gui(include_down, want_external, cfg_path=None):
     body.bind("<MouseWheel>", on_wheel)
 
     # --- подвал --------------------------------------------------------
-    foot = tk.Frame(root, bg=BG)
+    foot = tk.Frame(left, bg=BG)
     foot.pack(fill="x", side="bottom")
     canvas.pack(fill="both", expand=True)
     tk.Frame(foot, bg=RULE, height=1).pack(fill="x")
+    report_btn = tk.Label(foot, text="СОБРАТЬ ОТЧЁТ", font=(family, 10, "bold"), fg="#ffffff",
+                          bg=ACCENT, cursor="hand2", pady=9)
+    report_btn.pack(fill="x", padx=22, pady=(12, 0))
+    report_btn.bind("<Enter>", lambda _e: report_btn.config(bg=ACCENT_HOVER))
+    report_btn.bind("<Leave>", lambda _e: report_btn.config(bg=ACCENT))
+    folder_link = tk.Label(foot, text="папка отчётов", font=f_meta, fg=FG_MUTED, bg=BG,
+                           cursor="hand2")
+    folder_link.pack(pady=(4, 0))
+    folder_link.bind("<Button-1>", lambda _e: _open_file(folder))
+    folder_link.bind("<Enter>", lambda _e: folder_link.config(fg=FG))
+    folder_link.bind("<Leave>", lambda _e: folder_link.config(fg=FG_MUTED))
     foot_row = tk.Frame(foot, bg=BG)
     foot_row.pack(fill="x", padx=22, pady=12)
     ext_label = tk.Label(foot_row, text="внешний  —", font=f_meta, fg=FG_MUTED, bg=BG)
@@ -223,7 +245,7 @@ def run_gui(include_down, want_external, cfg_path=None):
         state["toast"] = root.after(1400, lambda: hint.config(text="клик — копировать", fg=FG_MUTED))
 
     # --- карточка адаптера ---------------------------------------------
-    cfg_for_cards = config.load(cfg_path)
+    cfg_for_cards = cfg
 
     def add_card(a, first):
         if not first:
@@ -330,28 +352,107 @@ def run_gui(include_down, want_external, cfg_path=None):
         else:
             ext_label.config(text="")
 
-    # --- окно проверки -------------------------------------------------
-    def open_check(_e=None):
-        if state.get("check_win") and state["check_win"].winfo_exists():
-            state["check_win"].lift()
+    # --- выезжающая панель справа ---------------------------------------
+    side = tk.Frame(root, bg=BG, highlightthickness=1, highlightbackground=RULE)
+    tabs = tk.Frame(side, bg=BG)
+    tabs.pack(fill="x", padx=16, pady=(14, 4))
+    pages = {}
+    tab_labels = {}
+    panel = {"open": False, "tab": None, "anim": None}
+
+    def show_tab(name):
+        panel["tab"] = name
+        for n, frame in pages.items():
+            frame.pack_forget()
+            tab_labels[n].config(fg=FG if n == name else FG_MUTED,
+                                 font=(family, 9, "bold" if n == name else "normal"))
+        pages[name].pack(fill="both", expand=True)
+
+    def animate(target_w, done=None, last=None):
+        """Плавно меняет ширину окна, не уводя его за край экрана."""
+        if panel["anim"]:
+            root.after_cancel(panel["anim"])
+        root.update_idletasks()
+        w, h = root.winfo_width(), root.winfo_height()
+        if w == last:  # окно не поддаётся (развёрнуто, упёрлось в minsize) - сразу в цель
+            w = target_w
+        x, y = root.winfo_x(), root.winfo_y()
+        step = max(1, abs(target_w - w) // 4)
+        new_w = target_w if abs(target_w - w) <= step else w + (step if target_w > w else -step)
+        screen = root.winfo_screenwidth()
+        if x + new_w > screen:
+            x = max(0, screen - new_w)
+        root.geometry("%dx%d+%d+%d" % (new_w, h, x, y))
+        if new_w != target_w:
+            panel["anim"] = root.after(12, lambda: animate(target_w, done, new_w))
+        else:
+            panel["anim"] = None
+            if done:
+                done()
+
+    def open_panel(name):
+        show_tab(name)
+        if panel["open"]:
             return
-        cfg_file = cfg_path or config.ensure_config()
-        cfg = config.load(cfg_file)
+        panel["open"] = True
+        root.update_idletasks()
+        left_w = root.winfo_width()
+        left.pack_forget()
+        left.configure(width=left_w)
+        left.pack_propagate(False)
+        left.pack(side="left", fill="y")
+        side.pack(side="left", fill="both", expand=True)
+        root.minsize(340 + 420, 300)
+        animate(left_w + PANEL_W)
 
-        w = tk.Toplevel(root)
-        state["check_win"] = w
-        w.title("Проверка сети")
-        w.configure(bg=BG)
-        w.geometry("640x560")
-        try:
-            w.iconbitmap(resource_path(ICON_NAME))
-        except Exception:
-            pass
+    def close_panel(_e=None):
+        if not panel["open"]:
+            return
+        panel["open"] = False
+        target = left.winfo_width()
+        root.minsize(340, 300)
 
-        bar = tk.Frame(w, bg=BG)
-        bar.pack(fill="x", padx=16, pady=(12, 6))
-        status = tk.Label(bar, text="проверка…", font=f_head, fg=FG_MUTED, bg=BG)
+        def finish():
+            side.pack_forget()
+            left.pack_forget()
+            left.pack_propagate(True)
+            left.pack(side="left", fill="both", expand=True)
+        animate(target, finish)
+
+    def tab_button(name, text):
+        b = tk.Label(tabs, text=text, font=(family, 9), fg=FG_MUTED, bg=BG, cursor="hand2")
+        b.pack(side="left", padx=(0, 16))
+        b.bind("<Button-1>", lambda _e: show_tab(name))
+        tab_labels[name] = b
+
+    tab_button("check", "ПРОВЕРКА")
+    tab_button("monitor", "МОНИТОРИНГ")
+    hide = tk.Label(tabs, text="скрыть  ›", font=f_meta, fg=FG_MUTED, bg=BG, cursor="hand2")
+    hide.pack(side="right")
+    hide.bind("<Button-1>", close_panel)
+    tk.Frame(side, bg=RULE, height=1).pack(fill="x")
+    body_side = tk.Frame(side, bg=BG)
+    body_side.pack(fill="both", expand=True)
+
+    def make_page(name, mono=False):
+        page = tk.Frame(body_side, bg=BG)
+        pages[name] = page
+        bar = tk.Frame(page, bg=BG)
+        bar.pack(fill="x", padx=16, pady=(10, 6))
+        status = tk.Label(bar, text="", font=f_head, fg=FG_MUTED, bg=BG, anchor="w")
         status.pack(side="left")
+        txt = tk.Text(page, font=("Consolas", 9) if mono else (family, 9), bg=BG, fg=FG,
+                      relief="flat", wrap="word", padx=16, pady=8, highlightthickness=0,
+                      state="disabled")
+        sb = tk.Scrollbar(page, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        for k, color in STATUS_COLOR.items():
+            txt.tag_configure(k, foreground=color)
+        txt.tag_configure("group", font=(family, 8, "bold"), foreground=FG_MUTED, spacing1=10)
+        txt.tag_configure("verdict", font=(family, 10, "bold"), spacing1=4)
+        txt.tag_configure("muted", foreground=FG_MUTED)
 
         def link(text, cmd):
             b = tk.Label(bar, text=text, font=f_meta, fg=FG_MUTED, bg=BG, cursor="hand2")
@@ -361,206 +462,187 @@ def run_gui(include_down, want_external, cfg_path=None):
             b.bind("<Leave>", lambda _e: b.config(fg=FG_MUTED))
             return b
 
-        txt = tk.Text(w, font=(family, 9), bg=BG, fg=FG, relief="flat", wrap="word",
-                      padx=16, pady=8, highlightthickness=0)
-        sb = tk.Scrollbar(w, command=txt.yview)
-        txt.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        txt.pack(fill="both", expand=True)
-        for k, color in STATUS_COLOR.items():
-            txt.tag_configure(k, foreground=color)
-        txt.tag_configure("group", font=(family, 8, "bold"), foreground=FG_MUTED,
-                          spacing1=10)
-        txt.tag_configure("verdict", font=(family, 10, "bold"), spacing1=4)
-        txt.tag_configure("muted", foreground=FG_MUTED)
-
-        run_state = {"group": None, "data": None, "busy": False}
-
         def put(text, *tags):
             txt.configure(state="normal")
             txt.insert("end", text, tags)
             txt.see("end")
             txt.configure(state="disabled")
 
-        def on_progress(c):
-            def show():
-                if c["group"] != run_state["group"]:
-                    run_state["group"] = c["group"]
-                    put(c["group"].upper() + "\n", "group")
-                put("  ● ", c["status"])
-                put("%s: " % c["name"])
-                put(c["summary"] + "\n", *(("muted",) if c["status"] == "info" else ()))
-            ui_queue.put(show)
-
-        def finished(data):
-            run_state["busy"] = False
-            if isinstance(data, Exception):
-                status.config(text="ошибка проверки", fg=FG_FAIL)
-                put("\nОшибка: %s\nПодробности в журнале: %s\n" % (data, report.logs_dir()),
-                    "fail")
-                return
-            run_state["data"] = data
-            report.save_check(data)
-            bad = any(c["status"] == "fail" for c in data["checks"])
-            status.config(text="есть проблемы" if bad else "проблем не найдено",
-                          fg=FG_FAIL if bad else FG_OK)
-            put("\nИТОГ\n", "group")
-            for v in data["verdict"]:
-                put(v + "\n", "verdict")
-            put("\nПроверка заняла %s с. Настройки: %s\n" % (
-                data["duration_sec"], cfg["path"] or "по умолчанию"), "muted")
-
-        def start(_e=None):
-            if run_state["busy"]:
-                return
-            run_state.update(busy=True, group=None, data=None)
+        def clear():
             txt.configure(state="normal")
             txt.delete("1.0", "end")
             txt.configure(state="disabled")
-            status.config(text="проверка…", fg=FG_MUTED)
-            in_background(lambda: diagnose.run(cfg, progress=on_progress), finished)
+        return status, link, put, clear
 
-        def save_report(_e=None):
-            if run_state["busy"]:
-                toast("дождитесь окончания проверки")
-                return
-            if not run_state["data"]:
-                return
-            status.config(text="собираю отчёт…", fg=FG_MUTED)
+    # --- проверка ------------------------------------------------------
+    c_status, c_link, c_put, c_clear = make_page("check")
+    run_state = {"group": None, "data": None, "busy": False, "after": []}
 
-            def done(path):
-                if isinstance(path, Exception):
-                    status.config(text="отчёт не собран: %s" % path, fg=FG_FAIL)
-                    return
-                status.config(text="отчёт сохранён", fg=FG_OK)
-                put("\nОтчёт: %s\n" % path, "verdict")
-                _show_in_explorer(path)
+    def on_progress(c):
+        def show():
+            if c["group"] != run_state["group"]:
+                run_state["group"] = c["group"]
+                c_put(c["group"].upper() + "\n", "group")
+            c_put("  ● ", c["status"])
+            c_put("%s: " % c["name"])
+            c_put(c["summary"] + "\n", *(("muted",) if c["status"] == "info" else ()))
+        ui_queue.put(show)
 
-            in_background(lambda: report.build_zip(run_state["data"], cfg), done)
-
-        def open_config(_e=None):
-            _open_file(cfg_file)
-
-        def continent_collector(_e=None):
-            from netdiag import continent
-            path = continent.collector_path()
-            if path:
-                _open_file(path)
-            else:
-                toast("утилита диагностики Континента не найдена")
-
-        link("настройки", open_config)
-        link("диагностика Континента", continent_collector)
-        link("сохранить отчёт", save_report)
-        link("повторить", start)
-        w.bind("<Escape>", lambda _e: w.destroy())
-        start()
-
-    # --- окно мониторинга --------------------------------------------
-    def open_monitor(_e=None):
-        if state.get("mon_win") and state["mon_win"].winfo_exists():
-            state["mon_win"].deiconify()
-            state["mon_win"].lift()
+    def finished(data):
+        run_state["busy"] = False
+        callbacks, run_state["after"] = run_state["after"], []
+        if isinstance(data, Exception):
+            c_status.config(text="ошибка проверки", fg=FG_FAIL)
+            c_put("\nОшибка: %s\nПодробности в журнале: %s\n" % (data, report.logs_dir()),
+                  "fail")
+            for cb in callbacks:
+                cb(None)
             return
-        cfg_file = cfg_path or config.ensure_config()
-        cfg = config.load(cfg_file)
+        run_state["data"] = data
+        report.save_check(data)
+        try:  # последняя проверка - в папку отчётов, в читаемом виде
+            with open(os.path.join(folder, "Последняя проверка.html"), "w",
+                      encoding="utf-8") as f:
+                f.write(report.format_html(data))
+        except OSError as e:
+            log.warning("не удалось сохранить проверку в папку отчётов: %s", e)
+        bad = any(c["status"] == "fail" for c in data["checks"])
+        c_status.config(text="есть проблемы" if bad else "проблем не найдено",
+                        fg=FG_FAIL if bad else FG_OK)
+        c_put("\nИТОГ\n", "group")
+        for v in data["verdict"]:
+            c_put(v + "\n", "verdict")
+        c_put("\nПроверка заняла %s с. Результат сохранён в папку отчётов.\n"
+              % data["duration_sec"], "muted")
+        for cb in callbacks:
+            cb(data)
 
-        w = tk.Toplevel(root)
-        state["mon_win"] = w
-        w.title("Мониторинг связи")
-        w.configure(bg=BG)
-        w.geometry("720x480")
-        try:
-            w.iconbitmap(resource_path(ICON_NAME))
-        except Exception:
-            pass
+    def start_check(_e=None, then=None):
+        if then:
+            run_state["after"].append(then)
+        if run_state["busy"]:
+            return
+        run_state.update(busy=True, group=None, data=None)
+        c_clear()
+        c_status.config(text="проверка…", fg=FG_MUTED)
+        in_background(lambda: diagnose.run(cfg, progress=on_progress), finished)
 
-        bar = tk.Frame(w, bg=BG)
-        bar.pack(fill="x", padx=16, pady=(12, 6))
-        status = tk.Label(bar, text="", font=f_head, fg=FG_MUTED, bg=BG)
-        status.pack(side="left")
-        txt = tk.Text(w, font=("Consolas", 9), bg=BG, fg=FG, relief="flat", wrap="word",
-                      padx=16, pady=8, highlightthickness=0, state="disabled")
-        sb = tk.Scrollbar(w, command=txt.yview)
-        txt.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        txt.pack(fill="both", expand=True)
-        for k, color in STATUS_COLOR.items():
-            txt.tag_configure(k, foreground=color)
+    def continent_collector(_e=None):
+        from netdiag import continent
+        path = continent.collector_path()
+        if path:
+            _open_file(path)
+        else:
+            toast("утилита диагностики Континента не найдена")
 
-        mon_state = {"mon": None, "fails": 0}
+    c_link("настройки", lambda _e: _open_file(cfg_file))
+    c_link("диагностика Континента", continent_collector)
+    c_link("повторить", start_check)
 
-        def put(line, level):
-            txt.configure(state="normal")
-            txt.insert("end", line + "\n", (level,))
-            txt.see("end")
-            txt.configure(state="disabled")
+    # --- мониторинг ----------------------------------------------------
+    m_status, m_link, m_put, _m_clear = make_page("monitor", mono=True)
+    mon_state = {"mon": None, "fails": 0}
 
-        def on_event(ev, line):
-            def show():
-                put(line, ev["level"])
-                if ev["level"] == "fail":
-                    mon_state["fails"] += 1
-                if mon_state["mon"] and not mon_state["mon"].stop_event.is_set():
-                    status.config(text="идёт мониторинг · событий с ошибками: %d"
-                                  % mon_state["fails"], fg=FG_FAIL if mon_state["fails"] else FG_OK)
-            ui_queue.put(show)
+    def mon_running():
+        return mon_state["mon"] is not None and not mon_state["mon"].stop_event.is_set()
 
-        def start(_e=None):
-            if mon_state["mon"] and not mon_state["mon"].stop_event.is_set():
+    def on_event(ev, line):
+        def show():
+            m_put(line + "\n", ev["level"])
+            if ev["level"] == "fail":
+                mon_state["fails"] += 1
+            if mon_running():
+                m_status.config(text="идёт мониторинг · ошибок: %d" % mon_state["fails"],
+                                fg=FG_FAIL if mon_state["fails"] else FG_OK)
+                monitor_btn.config(text="МОНИТОРИНГ ●" if not mon_state["fails"]
+                                   else "МОНИТОРИНГ ● %d" % mon_state["fails"])
+        ui_queue.put(show)
+
+    def start_monitor(_e=None):
+        if mon_running():
+            return
+        mon_state["fails"] = 0
+        m = monitor.Monitor(cfg, interval=2, on_event=on_event, out_dir=folder)
+        mon_state["mon"] = m
+        m_put("журнал пишется в папку отчётов: %s\n" % m.text_path, "info")
+        m_status.config(text="идёт мониторинг", fg=FG_OK)
+        monitor_btn.config(text="МОНИТОРИНГ ●")
+        m.start()
+
+    def stop_monitor(_e=None):
+        if mon_state["mon"]:
+            mon_state["mon"].stop()
+            m_status.config(text="остановлен", fg=FG_MUTED)
+            monitor_btn.config(text="МОНИТОРИНГ")
+
+    m_link("стоп", stop_monitor)
+    m_link("старт", start_monitor)
+
+    # --- одна кнопка: проверка + отчёт ----------------------------------
+    rep_state = {"busy": False}
+
+    def collect_report(_e=None):
+        if rep_state["busy"]:
+            return
+        rep_state["busy"] = True
+        report_btn.config(text="СОБИРАЮ ОТЧЁТ…")
+        open_panel("check")
+
+        def build(data):
+            if data is None:
+                rep_state["busy"] = False
+                report_btn.config(text="СОБРАТЬ ОТЧЁТ")
+                messagebox.showerror("IPInfo", "Проверка не удалась, отчёт не собран.\n"
+                                     "Подробности в журнале:\n%s" % report.logs_dir())
                 return
-            mon_state["fails"] = 0
-            m = monitor.Monitor(cfg, interval=2, on_event=on_event)
-            mon_state["mon"] = m
-            put("журнал: %s" % m.text_path, "info")
-            status.config(text="идёт мониторинг", fg=FG_OK)
-            m.start()
-
-        def stop(_e=None):
-            if mon_state["mon"]:
-                mon_state["mon"].stop()
-                status.config(text="остановлен", fg=FG_MUTED)
-
-        def save_report(_e=None):
-            status.config(text="собираю отчёт…", fg=FG_MUTED)
-
-            def work():
-                data = diagnose.run(cfg)
-                report.save_check(data)
-                return report.build_zip(data, cfg)
+            m = mon_state["mon"]
+            events = list(m.events) if m else None
+            summary = m.summary() if m else None
 
             def done(path):
+                rep_state["busy"] = False
+                report_btn.config(text="СОБРАТЬ ОТЧЁТ")
                 if isinstance(path, Exception):
-                    status.config(text="отчёт не собран: %s" % path, fg=FG_FAIL)
+                    messagebox.showerror("IPInfo", "Отчёт не собран: %s" % path)
                     return
-                status.config(text="отчёт сохранён", fg=FG_OK)
-                put("отчёт: %s" % path, "info")
+                c_put("\nОтчёт: %s\n" % path, "verdict")
                 _show_in_explorer(path)
+                messagebox.showinfo(
+                    "IPInfo - отчёт готов",
+                    "Отчёт собран.\n\nФайл: %s\nПапка: %s\n\n"
+                    "Папка сейчас откроется, файл в ней выделен.\n"
+                    "Отправьте этот zip-файл администратору.\n\n"
+                    "Посмотреть отчёт самому: откройте файл с тем же именем и "
+                    "расширением .html." % (os.path.basename(path), folder))
+            in_background(lambda: report.build_zip(data, cfg, folder=folder, events=events,
+                                                   monitor_summary=summary), done)
+        start_check(then=build)
 
-            in_background(work, done)
+    def open_check(_e=None):
+        open_panel("check")
+        if not run_state["data"] and not run_state["busy"]:
+            start_check()
 
-        def on_close():
-            if mon_state["mon"] and not mon_state["mon"].stop_event.is_set():
-                if not messagebox.askyesno("IPInfo", "Остановить мониторинг?\n\n"
-                                           "Чтобы он продолжал работать, сверните окно."):
-                    return
-                stop()
-            w.destroy()
+    def open_monitor(_e=None):
+        open_panel("monitor")
+        if not mon_running():
+            start_monitor()
 
-        for text, cmd in (("отчёт", save_report), ("стоп", stop), ("старт", start)):
-            b = tk.Label(bar, text=text, font=f_meta, fg=FG_MUTED, bg=BG, cursor="hand2")
-            b.pack(side="right", padx=(12, 0))
-            b.bind("<Button-1>", cmd)
-            b.bind("<Enter>", lambda _e, b=b: b.config(fg=FG))
-            b.bind("<Leave>", lambda _e, b=b: b.config(fg=FG_MUTED))
-        w.protocol("WM_DELETE_WINDOW", on_close)
-        start()
+    def on_close():
+        if mon_state["mon"]:
+            mon_state["mon"].stop()
+            mon_state["mon"].thread and mon_state["mon"].thread.join(3)
+        root.destroy()
 
+    report_btn.bind("<Button-1>", collect_report)
     reload_btn.bind("<Button-1>", refresh)
     check_btn.bind("<Button-1>", open_check)
     monitor_btn.bind("<Button-1>", open_monitor)
     root.bind("<F5>", refresh)
-    root.bind("<Escape>", lambda _e: root.destroy())
+    root.bind("<Escape>", lambda _e: close_panel() if panel["open"] else on_close())
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    if cfg.get("autostart", True):
+        root.after(500, start_monitor)
 
     pump()
     refresh()
