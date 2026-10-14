@@ -197,6 +197,78 @@ def tcp_connect(ip, port, timeout=5):
         return False, e.strerror or str(e)
 
 
+def _cert_info(der):
+    """Кому выдан сертификат: {'subject', 'issuer', 'names'} (разбор средствами Python)."""
+    import os
+    import ssl
+    import tempfile
+    info = {"subject": "", "issuer": "", "names": []}
+    try:
+        fd, path = tempfile.mkstemp(suffix=".pem")
+        with os.fdopen(fd, "w") as f:
+            f.write(ssl.DER_cert_to_PEM_cert(der))
+        try:
+            dec = ssl._ssl._test_decode_cert(path)
+        finally:
+            os.remove(path)
+    except Exception:
+        return info
+
+    def cn(rdns):
+        for rdn in rdns or ():
+            for k, v in rdn:
+                if k in ("commonName", "organizationName"):
+                    return v
+        return ""
+    info["subject"] = cn(dec.get("subject"))
+    info["issuer"] = cn(dec.get("issuer"))
+    info["names"] = [v for k, v in dec.get("subjectAltName", ()) if k == "DNS"] or \
+        ([info["subject"]] if info["subject"] else [])
+    return info
+
+
+def tls_probe(ip, port, sni=None, timeout=6):
+    """Обычное TLS-рукопожатие с адресом: что ответил сервер и чей у него сертификат.
+
+    Сертификат не проверяется на доверие - нужно только понять, кто на том конце.
+    Возвращает {'ok', 'version', 'subject', 'issuer', 'names'} или {'ok': False, 'error'}.
+    """
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+    except ssl.SSLError:
+        pass
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=sni) as s:
+                der = s.getpeercert(binary_form=True)
+                res = {"ok": True, "version": s.version()}
+                res.update(_cert_info(der) if der else {"subject": "", "issuer": "",
+                                                        "names": []})
+                return res
+    except ssl.SSLError as e:
+        reason = getattr(e, "reason", None) or str(e)
+        return {"ok": False, "error": str(reason).lower().replace("_", " ")}
+    except socket.timeout:
+        return {"ok": False, "error": "нет ответа на рукопожатие за %d с" % timeout}
+    except OSError as e:
+        return {"ok": False, "error": e.strerror or str(e)}
+
+
+def cert_matches(names, host):
+    """Подходит ли сертификат для имени host (с учётом *.domain)."""
+    host = (host or "").lower()
+    for n in names or ():
+        n = n.lower()
+        if n == host or (n.startswith("*.") and host.endswith(n[1:]) and
+                         host.count(".") == n.count(".")):
+            return True
+    return False
+
+
 EXTERNAL_IP_URLS = ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")
 
 

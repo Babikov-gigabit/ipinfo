@@ -146,7 +146,7 @@ class DiagnoseTest(unittest.TestCase):
                            desc="Continent TLS Adapter")
 
     def run_diag(self, adapters, ping=None, best=None, stats=None, tcp=(True, 20),
-                 ext=("8.8.4.4", None), devices=None, cont=None):
+                 ext=("8.8.4.4", None), devices=None, cont=None, tls=None):
         ping = ping or {}
         cont = cont or {"install": None, "servers": [], "config_error": None, "log_dirs": [],
                         "collector": None}
@@ -165,7 +165,9 @@ class DiagnoseTest(unittest.TestCase):
                                   stats.pop(0) if isinstance(stats, list) and stats else None), \
                 mock.patch.object(winsys, "net_devices", return_value=devices), \
                 mock.patch.object(winsys, "wifi_info", return_value=None), \
-                mock.patch.object(continent, "info", return_value=cont):
+                mock.patch.object(continent, "info", return_value=cont), \
+                mock.patch.object(probes, "tls_probe", side_effect=lambda ip, *a, **k: (
+                    tls or {}).get(ip, {"ok": False, "error": "handshake failure"})):
             return diagnose.run(self.cfg)
 
     def test_all_good(self):
@@ -330,6 +332,24 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("(с 10:00:00)", text)
         self.assertIn("первым подключился 203.0.113.1", text)
 
+    def test_vpn_connection_via_local_proxy(self):
+        srv = {"name": "ztn", "host": "vpng.example.ru", "port": 443, "proto": "tcp"}
+        p = r"C:\Program Files\Security Code\Continent ZTN\ztn.exe"
+        links = {"tcp": [
+            {"remote": "127.0.0.1", "rport": 10808, "process": "ztn", "path": p},
+            {"remote": "198.51.100.2", "rport": 443, "process": "sing-box",
+             "created": "2026-10-14T10:05:00"},
+            {"remote": "198.51.100.1", "rport": 443, "process": "sing-box",
+             "created": "2026-10-14T10:00:00"},
+            {"remote": "8.8.8.8", "rport": 443, "process": "sing-box"}], "routes": []}
+        st, text, used, _ = diagnose.vpn_connection(
+            links, ["198.51.100.1", "198.51.100.2"], srv, self.cfg)
+        self.assertEqual(st, diagnose.OK)
+        self.assertEqual(used, ["198.51.100.1", "198.51.100.2"])
+        self.assertIn("через локальный прокси 127.0.0.1:10808", text)
+        self.assertIn("первым - 198.51.100.1", text)
+        self.assertNotIn("нет в ответе DNS", text)
+
     def test_continent_config_servers(self):
         data = {"profiles": [{"name": "Работа", "server": "vpn-a.example.ru:8443",
                               "backup": ["https://203.0.113.9/ztn"]},
@@ -380,6 +400,20 @@ class DiagnoseTest(unittest.TestCase):
             with mock.patch.object(continent, "log_dirs", return_value=[d]):
                 names = [os.path.basename(f) for f in continent.log_files()]
         self.assertEqual(names, ["client.log"])
+
+    def test_vpn_tls_differs_between_ips(self):
+        self.cfg["vpn"] = [{"name": "ztn", "host": "vpng.example.ru", "port": 443,
+                            "proto": "tcp"}]
+        tls = {"198.51.100.2": {"ok": True, "version": "TLSv1.3", "subject": "cdn.example.com",
+                                "issuer": "R3", "names": ["cdn.example.com"]}}
+        with mock.patch.object(probes, "resolve_all",
+                               return_value=(["198.51.100.1", "198.51.100.2"], 3.0)):
+            d = self.run_diag([self.lan, self.vpn], tls=tls)
+        c = {c["name"]: c for c in d["checks"]}
+        self.assertIn("выдан не на vpng.example.ru", c["ztn → 198.51.100.2:443/tcp"]["summary"])
+        self.assertEqual(c["ztn → 198.51.100.2:443/tcp"]["status"], "warn")
+        self.assertIn("TLS: handshake failure", c["ztn → 198.51.100.1:443/tcp"]["summary"])
+        self.assertIn("отвечают на TLS по-разному", " ".join(d["verdict"]))
 
     def test_vpn_connection_from_host_route(self):
         srv = {"name": "ztn", "host": "vpng.example.ru", "port": 443, "proto": "tcp"}

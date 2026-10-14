@@ -82,7 +82,9 @@ def vpn_connection(links, ips, srv, cfg):
     Сначала ищутся TCP-соединения самого клиента (по имени процесса и пути
     к программе) - с любыми адресами, даже если DNS отдаёт другие. Соединения
     прокси других VPN (sing-box и т.п.) не учитываются: через них идут и наши
-    собственные проверки. Потом - соединения прочих программ и маршруты /32.
+    собственные проверки. Исключение - когда клиент сам ходит через локальный
+    прокси (127.0.0.1): тогда адрес сервера берётся из соединений прокси.
+    Потом - соединения прочих программ и маршруты /32.
     """
     if links is None:
         return None
@@ -104,6 +106,9 @@ def vpn_connection(links, ips, srv, cfg):
                 used.append(c["remote"])
         proc = own[0].get("process") or "?"
         tries = sorted({"%s:%s" % (c["remote"], c["rport"]) for c in syn})
+        local = [ip for ip in used if _is_loopback(ip)]
+        if local and est:
+            return _via_proxy(links, est, used, ips, srv, port, proc, own)
         if not est:
             return WARN, "клиент (процесс %s) пытается подключиться к %s, ответа нет" % (
                 proc, ", ".join(tries)), [], {"client_tcp": own}
@@ -155,6 +160,44 @@ def vpn_connection(links, ips, srv, cfg):
         return INFO, "соединений клиента не найдено; другие программы на порт %s: %s" % (
             port, ", ".join(others[:8])), [], {}
     return None
+
+
+def _is_loopback(ip):
+    try:
+        return ipaddress.IPv4Address(ip).is_loopback
+    except (ValueError, TypeError):
+        return False
+
+
+def _via_proxy(links, est, used, ips, srv, port, proc, own):
+    """Клиент подключён к локальному прокси (127.0.0.1): к серверу идёт сам прокси.
+
+    Адреса сервера тогда видны в соединениях процесса-прокси (sing-box и т.п.)."""
+    eps = []
+    for c in est:
+        ep = "%s:%s" % (c["remote"], c["rport"])
+        if ep not in eps:
+            eps.append(ep)
+    far = sorted((c for c in (links.get("tcp") or [])
+                  if winsys._proc_matches(c, winsys.PROXY_PROCS)
+                  and c.get("remote") in ips and (port is None or c.get("rport") == port)
+                  and c.get("state", "Established") == "Established"),
+                 key=lambda c: c.get("created") or "")
+    servers = []
+    for c in far:
+        if c["remote"] not in servers:
+            servers.append(c["remote"])
+    text = "клиент (процесс %s) подключён через локальный прокси %s" % (proc, ", ".join(eps))
+    if servers:
+        pproc = far[0].get("process") or "прокси"
+        text += "; прокси (%s) держит соединения с адресами сервера: %s" % (
+            pproc, ", ".join(servers))
+        if len(servers) > 1:
+            text += " (первым - %s)" % servers[0]
+        return OK, text, servers, {"client_tcp": own, "proxy_tcp": far}
+    text += "; соединений прокси с адресами %s не видно: к какому адресу сервера он " \
+            "подключён, не определить" % srv["host"]
+    return INFO, text, [], {"client_tcp": own}
 
 
 BROWSERS = ("chrome", "msedge", "firefox", "opera", "yandex", "browser", "brave", "vivaldi",
@@ -215,6 +258,21 @@ def _vpn_ip_status(r, s):
         else:
             parts.append("порт %d: %s" % (s["port"], r["tcp"]))
             st = FAIL
+    tls = r.get("tls")
+    if tls:
+        if tls["ok"]:
+            who = tls.get("subject") or "без имени"
+            text = "TLS %s, сертификат «%s»" % (tls.get("version") or "", who)
+            if tls.get("issuer") and tls["issuer"] != who:
+                text += " от «%s»" % tls["issuer"]
+            if not _is_ip(s["host"]) and tls.get("names") and \
+                    not probes.cert_matches(tls["names"], s["host"]):
+                text += " - выдан не на %s: похоже, это не тот сервер" % s["host"]
+                if st == OK:
+                    st = WARN
+            parts.append(text)
+        else:
+            parts.append("TLS: %s" % tls["error"])
     p = r["ping"]
     parts.append("ping " + _fmt_ping(p))
     if p["received"] and p["loss_pct"] >= 25 and st == OK:
@@ -281,7 +339,48 @@ def _probe_vpn_ip(ip, srv):
         res["mtu"] = probes.find_mtu(ip)
     if srv["proto"] == "tcp":
         res["tcp_ok"], res["tcp"] = probes.tcp_connect(ip, srv["port"])
+        if res["tcp_ok"]:
+            sni = srv["host"] if not _is_ip(srv["host"]) else None
+            res["tls"] = probes.tls_probe(ip, srv["port"], sni)
     return res
+
+
+def _tls_sig(tls):
+    if not tls:
+        return None
+    if tls["ok"]:
+        return "сертификат «%s»" % (tls.get("subject") or "без имени")
+    return "отказ «%s»" % tls["error"]
+
+
+def _tls_mismatch(r, srv):
+    """Текст для итога, если адреса одного сервера ведут себя по-разному при TLS
+    или сертификат выдан на другое имя - значит, часть адресов ведёт не туда."""
+    per = {ip: x.get("tls") for ip, x in r.get("per_ip", {}).items() if x.get("tls")}
+    if not per:
+        return None
+    foreign = [ip for ip, t in per.items() if t["ok"] and t.get("names") and
+               not _is_ip(srv["host"]) and not probes.cert_matches(t["names"], srv["host"])]
+    sigs = {}
+    for ip, t in per.items():
+        sigs.setdefault(_tls_sig(t), []).append(ip)
+    if len(sigs) > 1:
+        return "адреса отвечают на TLS по-разному (%s): часть из них, вероятно, не сервер " \
+               "VPN, и клиент на них получит ошибку рукопожатия вроде «alert protocol " \
+               "version»" % "; ".join("%s - %s" % (", ".join(ips), sig)
+                                      for sig, ips in sigs.items())
+    if foreign:
+        return "на адресах %s сертификат выдан не на %s: это чужой сервер или трафик " \
+               "перехватывает прокси/другой VPN" % (", ".join(foreign), srv["host"])
+    return None
+
+
+def _is_ip(text):
+    try:
+        ipaddress.IPv4Address(text)
+        return True
+    except ValueError:
+        return False
 
 
 def _probe_vpn_server(srv):
@@ -440,7 +539,7 @@ def run(cfg, progress=None):
     if not vpn_list:
         rep.add(G, "Настройки", INFO, "серверы не заданы: добавьте их в раздел [vpn] файла ipinfo.ini")
     links = f_links.result()
-    vpn_connected, vpn_bad_ips = {}, {}
+    vpn_connected, vpn_bad_ips, vpn_tls_issues = {}, {}, {}
     for s in vpn_list:
         r = f_vpn[s["name"]].result()
         if not r["ips"]:
@@ -467,6 +566,9 @@ def run(cfg, progress=None):
             rep.add(G, "%s → %s:%d/%s" % (s["name"], ip, s["port"], s["proto"]), st,
                     ", ".join(parts), **r["per_ip"][ip])
         (vpn_ok if good else vpn_fail).append(s["name"])
+        mismatch = _tls_mismatch(r, s)
+        if mismatch:
+            vpn_tls_issues[s["name"]] = mismatch
 
         # К какому из адресов реально подключён клиент
         line = vpn_connection(links, r["ips"], s, cfg)
@@ -605,6 +707,7 @@ def run(cfg, progress=None):
         "vpn_connected": vpn_connected,
         "continent": cont,
         "vpn_bad_ips": vpn_bad_ips,
+        "vpn_tls_issues": vpn_tls_issues,
         "network_links": links,
         "rdp_out": {"ok": rdp_out_ok, "fail": rdp_out_fail},
         "firewall": fw,
@@ -773,6 +876,8 @@ def verdict(data, physical, gw_ok, inet_ok, dns_fail, vpn_ok, vpn_fail, tunnels,
         if bad:
             line += " Этот адрес сейчас не проходит проверку: %s." % ", ".join(sorted(bad))
         v.append(line)
+    for name, text in (data.get("vpn_tls_issues") or {}).items():
+        v.append("%s: %s" % (name, text))
     for name, bad in (data.get("vpn_bad_ips") or {}).items():
         if name in vpn_ok:
             v.append("У %s недоступен адрес %s: при переподключении на него клиент "
