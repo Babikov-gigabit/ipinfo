@@ -434,3 +434,28 @@ def server_links(links, ips, port=None):
         if ip in ipset:
             res["routes"].append(dict(r, ip=ip))
     return res
+
+
+# --------------------------------------------------------------------------
+# Системный прокси Windows (его берёт Континент при «Автоматически
+# определять настройки прокси»; Happ и подобные любят его включать)
+# --------------------------------------------------------------------------
+def system_proxy():
+    """{'enabled', 'server', 'pac'} из настроек пользователя или None вне Windows."""
+    if not IS_WINDOWS:
+        return None
+    import winreg
+    res = {"enabled": False, "server": "", "pac": ""}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as k:
+            for name, key in (("enabled", "ProxyEnable"), ("server", "ProxyServer"),
+                              ("pac", "AutoConfigURL")):
+                try:
+                    res[name] = winreg.QueryValueEx(k, key)[0]
+                except OSError:
+                    pass
+    except OSError:
+        return None
+    res["enabled"] = bool(res["enabled"])
+    return res

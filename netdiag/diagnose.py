@@ -420,6 +420,23 @@ def run(cfg, progress=None):
         if cont["collector"]:
             parts.append("утилита диагностики: %s" % cont["collector"])
         rep.add(G, "Континент: клиент", INFO, "; ".join(parts), continent=cont)
+        for prof in cont.get("profiles", []):
+            servers = prof["servers"]
+            text = ", ".join("%d) %s:%d" % (i + 1, x["host"], x["port"])
+                             for i, x in enumerate(servers))
+            if len(servers) > 1:
+                text += ". Клиент подключается к первому адресу, к следующему переходит, " \
+                        "только когда исчерпает попытки на предыдущем"
+            rep.add(G, "Континент: профиль «%s»" % prof["name"], INFO, text, profile=prof)
+        proxy = winsys.system_proxy()
+        if proxy and (proxy["enabled"] or proxy["pac"]):
+            where = proxy["server"] if proxy["enabled"] else "скрипт %s" % proxy["pac"]
+            local = any(h in (proxy["server"] or proxy["pac"]) for h in ("127.0.0.1", "localhost"))
+            rep.add(G, "Системный прокси", WARN,
+                    "в Windows включён прокси %s%s. Если в Континенте включено «Автоматически "
+                    "определять настройки прокси», он подключается к серверу через этот "
+                    "прокси" % (where, " - это программа на этом ПК (вероятно, другой VPN)"
+                                if local else ""), proxy=proxy)
     if not vpn_list:
         rep.add(G, "Настройки", INFO, "серверы не заданы: добавьте их в раздел [vpn] файла ipinfo.ini")
     links = f_links.result()

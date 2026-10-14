@@ -345,6 +345,25 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("Континент: клиент", names)
         self.assertTrue(any("203.0.113.9:443" in n for n in names))
 
+    def test_continent_profile_order_and_proxy(self):
+        data = {"profiles": [{"name": "Работа", "profileType": "local", "connections": [
+            {"host": "vpn-a.example.ru", "note": "", "tcpPort": 443, "udpPort": 4433},
+            {"host": "203.0.113.9", "note": "", "tcpPort": 8443, "udpPort": 4433}]}]}
+        prof = continent.profiles_from_data(data)
+        self.assertEqual([(x["host"], x["port"]) for x in prof[0]["servers"]],
+                         [("vpn-a.example.ru", 443), ("203.0.113.9", 8443)])
+        self.assertEqual(continent.servers_from_config(data)[1],
+                         {"host": "203.0.113.9", "port": 8443})
+        cont = {"install": r"C:\x", "servers": [], "config_error": None, "log_dirs": [],
+                "collector": None, "profiles": prof}
+        with mock.patch.object(winsys, "system_proxy", return_value={
+                "enabled": True, "server": "127.0.0.1:10809", "pac": ""}):
+            d = self.run_diag([self.lan, self.vpn], cont=cont)
+        c = {c["name"]: c for c in d["checks"]}
+        self.assertIn("1) vpn-a.example.ru:443, 2) 203.0.113.9:8443",
+                      c["Континент: профиль «Работа»"]["summary"])
+        self.assertEqual(c["Системный прокси"]["status"], "warn")
+
     def test_vpn_connection_from_host_route(self):
         srv = {"name": "ztn", "host": "vpng.example.ru", "port": 443, "proto": "tcp"}
         links = {"tcp": [], "routes": [{"prefix": "8.8.4.4/32", "nexthop": "192.168.1.1"},

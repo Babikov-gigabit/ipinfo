@@ -126,19 +126,82 @@ def _endpoint(text):
     return None
 
 
+def _port_of(d):
+    """Порт из словаря: tcpPort важнее прочих (в профиле есть и udpPort)."""
+    keys = {str(k).lower(): v for k, v in d.items()}
+    for k in ["tcpport", "port"] + [k for k in keys if "port" in k and "udp" not in k]:
+        try:
+            return int(keys[k])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def profiles_from_data(data, source=""):
+    """Профили подключения: словари со списком connections [{host, tcpPort, ...}].
+
+    Порядок адресов важен: клиент подключается к первому, а к следующему
+    переходит, только когда исчерпает попытки на предыдущем."""
+    found = []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            conns = obj.get("connections")
+            if isinstance(conns, list) and any(isinstance(c, dict) and c.get("host")
+                                               for c in conns):
+                servers = []
+                for c in conns:
+                    if isinstance(c, dict) and c.get("host"):
+                        servers.append({"host": str(c["host"]).strip(),
+                                        "port": _port_of(c) or 443,
+                                        "udp_port": c.get("udpPort")})
+                found.append({"name": obj.get("name") or "?", "servers": servers,
+                              "type": obj.get("profileType"), "source": source})
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+    walk(data)
+    return found
+
+
+def _json_files(max_size=2 * 1024 * 1024):
+    dirs = ([install_dir()] if install_dir() else []) + log_dirs()
+    for d in dirs:
+        for root, _dirs, names in os.walk(d):
+            for n in names:
+                if n.lower().endswith(".json"):
+                    path = os.path.join(root, n)
+                    try:
+                        if os.path.getsize(path) <= max_size:
+                            yield path
+                    except OSError:
+                        continue
+
+
+def profiles():
+    """Профили из всех json-файлов клиента (настройки, профили, экспорт)."""
+    res = []
+    for path in _json_files():
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for p in profiles_from_data(data, path):
+            if not any(p["name"] == q["name"] and p["servers"] == q["servers"] for q in res):
+                res.append(p)
+    return res
+
+
 def servers_from_config(data):
     """Все адреса серверов из разобранного JSON: [{'host', 'port'}] без повторов."""
     found = []
 
     def walk(obj, port_hint=None):
         if isinstance(obj, dict):
-            port = None
-            for k, v in obj.items():
-                if "port" in str(k).lower():
-                    try:
-                        port = int(v)
-                    except (TypeError, ValueError):
-                        pass
+            port = _port_of(obj)
             for v in obj.values():
                 walk(v, port or port_hint)
         elif isinstance(obj, list):
@@ -167,7 +230,7 @@ def info():
     """Сводка о клиенте: папка, серверы из настроек, журналы, утилита диагностики."""
     d = install_dir()
     res = {"install": d, "servers": [], "config_error": None, "log_dirs": log_dirs(),
-           "collector": collector_path()}
+           "collector": collector_path(), "profiles": []}
     for path in config_files():
         try:
             with open(path, encoding="utf-8-sig") as f:
@@ -175,4 +238,13 @@ def info():
                                    if s not in res["servers"]]
         except (OSError, ValueError) as e:
             res["config_error"] = "%s: %s" % (os.path.basename(path), e)
+    try:
+        res["profiles"] = profiles()
+    except Exception as e:
+        res["config_error"] = "профили: %s" % e
+    # адреса из профилей - первыми и в их порядке
+    ordered = [{"host": x["host"].lower(), "port": x["port"]}
+               for p in res["profiles"] for x in p["servers"]]
+    res["servers"] = [x for i, x in enumerate(ordered) if x not in ordered[:i]] + \
+        [x for x in res["servers"] if x not in ordered]
     return res
