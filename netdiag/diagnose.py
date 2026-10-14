@@ -17,7 +17,7 @@ import platform
 import socket
 import time
 
-from . import __version__, adapters as ad, probes, winsys
+from . import __version__, adapters as ad, continent, probes, winsys
 
 OK, WARN, FAIL, INFO = "ok", "warn", "fail", "info"
 
@@ -60,6 +60,19 @@ def _other_vpn(adapter_list, cfg):
         text = ("%s %s" % (a.get("name", ""), a.get("description", ""))).lower()
         if any(w.lower() in text for w in cfg.get("other_vpn", [])):
             res.append(a)
+    return res
+
+
+def _continent_servers(cont, configured):
+    """Серверы из настроек клиента Континента, которых нет в [vpn] ipinfo.ini."""
+    known = {s["host"].lower() for s in configured}
+    res = []
+    for x in cont.get("servers", []):
+        if x["host"].lower() in known:
+            continue
+        known.add(x["host"].lower())
+        res.append({"name": "Континент (настройки клиента) %s" % x["host"], "host": x["host"],
+                    "port": x["port"], "proto": "tcp"})
     return res
 
 
@@ -308,7 +321,9 @@ def run(cfg, progress=None):
     f_gw = {g: pool.submit(probes.ping, g, 4) for g in gateways}
     f_inet = {h: pool.submit(_probe_host, h) for h in cfg["internet"]}
     f_ext = pool.submit(probes.external_ip)
-    f_vpn = {s["name"]: pool.submit(_probe_vpn_server, s) for s in cfg["vpn"]}
+    cont = continent.info()
+    vpn_list = list(cfg["vpn"]) + _continent_servers(cont, cfg["vpn"])
+    f_vpn = {s["name"]: pool.submit(_probe_vpn_server, s) for s in vpn_list}
     internal = cfg["internal"] or _auto_internal(tunnels, cfg)
     f_int = {i["name"]: pool.submit(_probe_host, i["host"], 6, bool(tunnels))
              for i in internal}
@@ -393,11 +408,23 @@ def run(cfg, progress=None):
     # ---- 3. VPN-серверы -----------------------------------------------------
     G = "VPN-серверы"
     vpn_ok, vpn_fail, vpn_via_other = [], [], []
-    if not cfg["vpn"]:
+    if cont["install"]:
+        parts = ["установлен в %s" % cont["install"]]
+        if cont["servers"]:
+            parts.append("серверы в настройках клиента: %s" % ", ".join(
+                "%s:%d" % (x["host"], x["port"]) for x in cont["servers"]))
+        elif cont["config_error"]:
+            parts.append("настройки не прочитаны (%s)" % cont["config_error"])
+        else:
+            parts.append("серверов в настройках клиента не найдено")
+        if cont["collector"]:
+            parts.append("утилита диагностики: %s" % cont["collector"])
+        rep.add(G, "Континент: клиент", INFO, "; ".join(parts), continent=cont)
+    if not vpn_list:
         rep.add(G, "Настройки", INFO, "серверы не заданы: добавьте их в раздел [vpn] файла ipinfo.ini")
     links = f_links.result()
     vpn_connected, vpn_bad_ips = {}, {}
-    for s in cfg["vpn"]:
+    for s in vpn_list:
         r = f_vpn[s["name"]].result()
         if not r["ips"]:
             vpn_fail.append(s["name"])
@@ -559,6 +586,7 @@ def run(cfg, progress=None):
         "other_vpn": [a["name"] for a in other_vpn],
         "vpn_via_other": vpn_via_other,
         "vpn_connected": vpn_connected,
+        "continent": cont,
         "vpn_bad_ips": vpn_bad_ips,
         "network_links": links,
         "rdp_out": {"ok": rdp_out_ok, "fail": rdp_out_fail},

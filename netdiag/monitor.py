@@ -18,7 +18,7 @@ import os
 import threading
 import time
 
-from . import adapters as ad, diagnose, probes, winsys
+from . import adapters as ad, continent, diagnose, probes, winsys
 from .report import logs_dir, log
 
 HISTORY_SEC = 120     # сколько секунд истории держать для разбора обрыва RDP
@@ -84,6 +84,7 @@ class Monitor:
         self.state = {}
         self.vpn = {}          # имя сервера -> {"ips": [...], "used": [...]}
         self._vpn_fut = None
+        self.vpn_list = list(cfg.get("vpn", []))  # + серверы из настроек Континента
         self.vpn_conns = None  # соединения и попытки подключения VPN-клиента
         self.rdp_conns = None  # открытые TCP-соединения клиента RDP: ключ -> dict
         self.rdp_closed = []   # недавно закрытые соединения клиента RDP
@@ -191,7 +192,11 @@ class Monitor:
             self.emit("info", "Wi-Fi «%s», точка %s, сигнал %s%%" % (
                 wifi.get("ssid"), wifi.get("bssid"), wifi.get("signal_pct")))
         stats = self._tunnel_stats(snap)
-        if self.cfg.get("vpn"):
+        try:
+            self.vpn_list += diagnose._continent_servers(continent.info(), self.vpn_list)
+        except Exception as e:
+            log.warning("настройки Континента: %s", e)
+        if self.vpn_list:
             self._apply_vpn(self._read_vpn())
         self._check_tcp(time.time())
         last_wifi = last_rdp_log = last_rdp_tcp = last_vpn = time.time()
@@ -250,7 +255,7 @@ class Monitor:
                 except Exception as e:
                     log.warning("проверка VPN-сервера: %s", e)
                 self._vpn_fut = None
-            if self.cfg.get("vpn") and not self._vpn_fut and now - last_vpn >= VPN_EVERY:
+            if self.vpn_list and not self._vpn_fut and now - last_vpn >= VPN_EVERY:
                 last_vpn = now
                 self._vpn_fut = self.pool.submit(self._read_vpn)
             tick["vpn"] = {n: list(v.get("used") or []) for n, v in self.vpn.items()}
@@ -355,7 +360,7 @@ class Monitor:
         """Адреса имён VPN-серверов из DNS и к каким из них есть подключение."""
         links = winsys.network_links()
         res = {}
-        for s in self.cfg.get("vpn", []):
+        for s in self.vpn_list:
             ips, info = probes.resolve_all(s["host"])
             if not ips:
                 res[s["name"]] = {"host": s["host"], "ips": [], "error": info, "used": None}
@@ -455,7 +460,7 @@ class Monitor:
         """Попытки подключения и соединения самого VPN-клиента: видно, какой адрес
         сервера он пробовал первым, какой не ответил и к какому подключился."""
         patterns = [w for ws in self.cfg["patterns"].values() for w in ws]
-        ports = {v["port"] for v in self.cfg.get("vpn", []) if v.get("proto") == "tcp"}
+        ports = {v["port"] for v in self.vpn_list if v.get("proto") == "tcp"}
         cur = {}
         for c in winsys.client_links({"tcp": conns}, patterns)["client"]:
             if not ports or c["rport"] in ports:

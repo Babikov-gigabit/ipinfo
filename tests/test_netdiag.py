@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from netdiag import sysutil, adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
+from netdiag import sysutil, continent, adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
 
 
 def adapter(name, ipv4=(), up=True, iftype=6, gateway=(), dns=(), index=1, desc=""):
@@ -145,8 +145,10 @@ class DiagnoseTest(unittest.TestCase):
                            desc="Continent TLS Adapter")
 
     def run_diag(self, adapters, ping=None, best=None, stats=None, tcp=(True, 20),
-                 ext=("8.8.4.4", None), devices=None):
+                 ext=("8.8.4.4", None), devices=None, cont=None):
         ping = ping or {}
+        cont = cont or {"install": None, "servers": [], "config_error": None, "log_dirs": [],
+                        "collector": None}
         stats = stats or {}
         with mock.patch.object(ad, "get_adapters", return_value=adapters), \
                 mock.patch.object(probes, "ping", side_effect=lambda ip, *a, **k:
@@ -161,7 +163,8 @@ class DiagnoseTest(unittest.TestCase):
                 mock.patch.object(ad, "if_stats", side_effect=lambda idx:
                                   stats.pop(0) if isinstance(stats, list) and stats else None), \
                 mock.patch.object(winsys, "net_devices", return_value=devices), \
-                mock.patch.object(winsys, "wifi_info", return_value=None):
+                mock.patch.object(winsys, "wifi_info", return_value=None), \
+                mock.patch.object(continent, "info", return_value=cont):
             return diagnose.run(self.cfg)
 
     def test_all_good(self):
@@ -326,6 +329,22 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("(с 10:00:00)", text)
         self.assertIn("первым подключился 203.0.113.1", text)
 
+    def test_continent_config_servers(self):
+        data = {"profiles": [{"name": "Работа", "server": "vpn-a.example.ru:8443",
+                              "backup": ["https://203.0.113.9/ztn"]},
+                             {"gateway": {"address": "198.51.100.4", "port": 4433}}],
+                "log": "client.log", "update": "https://securitycode.ru/x"}
+        self.assertEqual(continent.servers_from_config(data), [
+            {"host": "vpn-a.example.ru", "port": 8443}, {"host": "203.0.113.9", "port": 443},
+            {"host": "198.51.100.4", "port": 4433}])
+        cont = {"install": r"C:\Program Files\Security Code\Continent ZTN Client",
+                "servers": [{"host": "203.0.113.9", "port": 443}], "config_error": None,
+                "log_dirs": [], "collector": r"C:\x\LogCollector.exe"}
+        d = self.run_diag([self.lan, self.vpn], cont=cont)
+        names = [c["name"] for c in d["checks"]]
+        self.assertIn("Континент: клиент", names)
+        self.assertTrue(any("203.0.113.9:443" in n for n in names))
+
     def test_vpn_connection_from_host_route(self):
         srv = {"name": "ztn", "host": "vpng.example.ru", "port": 443, "proto": "tcp"}
         links = {"tcp": [], "routes": [{"prefix": "8.8.4.4/32", "nexthop": "192.168.1.1"},
@@ -422,7 +441,7 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("другой VPN: выключен → happ-tun", texts)
 
     def test_vpn_dns_and_connected_ip_changes(self):
-        self.m.cfg["vpn"] = [{"name": "Континент", "host": "vpn.example", "port": 443,
+        self.m.vpn_list = self.m.cfg["vpn"] = [{"name": "Континент", "host": "vpn.example", "port": 443,
                               "proto": "tcp"}]
         links = {"tcp": [{"remote": "192.0.2.1", "rport": 443, "process": "ztn"}], "routes": []}
         dns = {"ips": ["192.0.2.1", "192.0.2.2"]}
@@ -498,7 +517,7 @@ class MonitorTest(unittest.TestCase):
         self.assertIsInstance(conns, list)
 
     def test_vpn_client_tries_first_ip_then_second(self):
-        self.m.cfg["vpn"] = [{"name": "К", "host": "vpn.example", "port": 443, "proto": "tcp"}]
+        self.m.vpn_list = self.m.cfg["vpn"] = [{"name": "К", "host": "vpn.example", "port": 443, "proto": "tcp"}]
         path = r"C:\Program Files\Security Code\Continent ZTN\ztn.exe"
 
         def c(ip, lport, state):

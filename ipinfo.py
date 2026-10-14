@@ -441,7 +441,16 @@ def run_gui(include_down, want_external, cfg_path=None):
         def open_config(_e=None):
             _open_file(cfg_file)
 
+        def continent_collector(_e=None):
+            from netdiag import continent
+            path = continent.collector_path()
+            if path:
+                _open_file(path)
+            else:
+                toast("утилита диагностики Континента не найдена")
+
         link("настройки", open_config)
+        link("диагностика Континента", continent_collector)
         link("сохранить отчёт", save_report)
         link("повторить", start)
         w.bind("<Escape>", lambda _e: w.destroy())

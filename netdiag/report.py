@@ -13,11 +13,12 @@ import zipfile
 
 from . import __version__
 from .sysutil import data_dir
-from . import winsys
+from . import continent, winsys
 
 MARK = {"ok": "[ OK ]", "warn": "[ !! ]", "fail": "[FAIL]", "info": "[ -- ]"}
 MAX_LOG_FILE = 5 * 1024 * 1024  # из логов VPN-клиента берём последние 5 МБ файла
 MAX_LOG_FILES = 20
+MAX_CONTINENT_LOGS = 30 * 1024 * 1024  # всего из журналов Континента
 
 log = logging.getLogger("ipinfo")
 
@@ -117,6 +118,33 @@ def _add_vpn_logs(z, logs_cfg):
     return notes
 
 
+def _add_continent(z):
+    """Настройки и журналы клиента Континента - находятся сами, без раздела [logs]."""
+    notes = []
+    try:
+        for f in continent.config_files():
+            z.write(f, "continent/" + os.path.basename(f))
+        total = 0
+        for f in continent.log_files():
+            if total >= MAX_CONTINENT_LOGS:
+                notes.append("Континент: остальные журналы не вошли (ограничение %d МБ)"
+                             % (MAX_CONTINENT_LOGS // 2 ** 20))
+                break
+            try:
+                size = os.path.getsize(f)
+                total += min(size, MAX_LOG_FILE)
+                with open(f, "rb") as fh:
+                    if size > MAX_LOG_FILE:
+                        fh.seek(size - MAX_LOG_FILE)
+                    rel = os.path.basename(os.path.dirname(f)) + "/" + os.path.basename(f)
+                    z.writestr("continent/logs/" + rel, fh.read())
+            except OSError as e:
+                notes.append("Континент: %s - %s" % (f, e))
+    except Exception as e:
+        notes.append("Континент: журналы не собраны (%s)" % e)
+    return notes
+
+
 def build_zip(data, cfg, path=None):
     """Собирает отчёт в zip: проверка, журналы, системные выводы, логи VPN.
 
@@ -140,6 +168,7 @@ def build_zip(data, cfg, path=None):
             if os.path.isfile(f):
                 z.write(f, "ipinfo_logs/" + os.path.basename(f))
         notes = _add_vpn_logs(z, cfg.get("logs", {}))
+        notes += _add_continent(z)
         info = ["IPInfo %s" % __version__, "Собран: %s" % stamp,
                 "Компьютер: %s" % socket.gethostname(), "ОС: %s" % platform.platform(),
                 "Пользователь: %s" % (os.environ.get("USERNAME") or os.environ.get("USER", ""))]
