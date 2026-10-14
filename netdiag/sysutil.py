@@ -151,3 +151,16 @@ def idle_seconds():
         return None
     now = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
     return ((now - info.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
+def unblock_self():
+    """Снимает с собственного exe отметку «загружено из интернета» (поток
+    Zone.Identifier). Из-за неё Windows при каждом запуске спрашивает про
+    неизвестного издателя. True, если отметка была и снята."""
+    if not (IS_WINDOWS and FROZEN):
+        return False
+    try:
+        os.remove(sys.executable + ":Zone.Identifier")
+        return True
+    except OSError:
+        return False

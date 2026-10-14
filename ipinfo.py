@@ -26,7 +26,7 @@ import time
 import traceback
 
 from netdiag import __version__, adapters as ad, config, diagnose, fixes, live, monitor, probes, report
-from netdiag.sysutil import attach_console, reports_folder, resource_path
+from netdiag.sysutil import attach_console, reports_folder, resource_path, unblock_self
 
 ICON_NAME = "ip-icon.ico"
 log = report.log
@@ -817,6 +817,8 @@ def main():
     args = p.parse_args()
 
     log.info("запуск IPInfo %s, ключи: %s", __version__, " ".join(sys.argv[1:]) or "-")
+    if unblock_self():
+        log.info("снята отметка «загружено из интернета»: предупреждения об издателе больше не будет")
 
     if args.monitor:
         cfg = config.load(args.config or config.ensure_config())
