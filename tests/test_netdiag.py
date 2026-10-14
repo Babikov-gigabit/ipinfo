@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from netdiag import sysutil, session, continent, adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
+from netdiag import sysutil, live, session, continent, adapters as ad, config, diagnose, monitor, probes, report, winsys  # noqa: E402
 
 
 def adapter(name, ipv4=(), up=True, iftype=6, gateway=(), dns=(), index=1, desc=""):
@@ -498,6 +498,57 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("Итог", page)
         self.assertIn("туннель «Continent» пропал<br>", page)
         self.assertIn("мониторинг 5 мин", page)
+
+
+class LiveTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = config.load(os.devnull + "-missing")
+        self.cfg["other_vpn"] = ["happ"]
+
+    def test_rdp_transport(self):
+        ev = lambda i, t: {"id": i, "time": "2026-10-14T13:%s.0+03:00" % t}
+        self.assertEqual(live.rdp_transport([ev(1024, "00:00"), ev(1103, "00:02")])[0],
+                         "UDP (с 13:00:02), управление по TCP")
+        text, st = live.rdp_transport([ev(1024, "00:00"), ev(1103, "00:02"), ev(1105, "05:00")])
+        self.assertEqual((text, st), ("TCP: UDP-канал разорван в 13:05:00", "warn"))
+        # старый сеанс с UDP, новый - без событий UDP
+        self.assertEqual(live.rdp_transport([ev(1024, "00:00"), ev(1103, "00:02"),
+                                             ev(1024, "10:00"), ev(1102, "10:01")])[0],
+                         "TCP: UDP-канал не установился")
+        self.assertIn("UDP", live.rdp_transport([], udp_socket=True)[0])
+        self.assertEqual(live.rdp_transport(None, udp_socket=False)[0], "TCP")
+
+    def test_read_rows(self):
+        lan = adapter("Wi-Fi", ["192.168.100.5/24"], gateway=["192.168.100.12"], index=5)
+        vpn = adapter("Подключение по локальной сети", ["10.61.207.130/32"], iftype=53, index=9,
+                      desc="Continent TLS Adapter")
+        happ = adapter("happ-tun", ["172.19.0.1/30"], iftype=53, index=12, desc="sing-box TUN")
+        conns = [{"remote": "10.61.220.15", "rport": 3389, "lport": 50000, "pid": 7,
+                  "process": "mstsc"},
+                 {"remote": "127.0.0.1", "rport": 10808, "lport": 50001, "pid": 8,
+                  "process": "VpnService",
+                  "path": r"C:\Program Files\Security Code\Continent ZTN Client\VpnService.exe"}]
+        info = live.Info(self.cfg)
+        info.ext = ("178.176.250.130", 1000)
+        evs = [{"id": 1024, "time": "2026-10-14T13:00:00"}, {"id": 1103, "time": "2026-10-14T13:00:02"}]
+        with mock.patch.object(winsys, "rdp_client_events", return_value=evs):
+            rows, key = info.read([lan, vpn, happ], conns, udp={7}, now=1030)
+        d = {r[0]: (r[1], r[2]) for r in rows}
+        self.assertEqual(d["VPN"][0], "подключён: Континент, через локальный прокси "
+                                      "127.0.0.1:10808")
+        info.vpn_ips = {"109.70.24.115"}
+        conns.append({"remote": "109.70.24.115", "rport": 443, "lport": 50002, "pid": 9,
+                      "process": "sing-box"})
+        rows2, _ = info.read([lan, vpn, happ], conns, udp={7}, now=1030)
+        self.assertEqual(rows2[0][1], "подключён: Континент, сервер 109.70.24.115:443 "
+                                      "через прокси sing-box")
+        self.assertIn("happ-tun", d["Другой VPN"][0])
+        self.assertTrue(d["Внутренний IP"][0].startswith("10.61.207.130"))
+        self.assertTrue(d["Локальный IP"][0].startswith("192.168.100.5"))
+        self.assertEqual(d["Внешний IP"][0], "178.176.250.130  (проверен 30 с назад)")
+        self.assertEqual(d["RDP"], ("подключён к 10.61.220.15:3389 (mstsc, 0 с)", "ok"))
+        self.assertTrue(d["Протокол RDP"][0].startswith("UDP"))
+        self.assertFalse(info.want_external(key, 1031) and info.ext_key == key)
 
 
 class SessionTest(unittest.TestCase):

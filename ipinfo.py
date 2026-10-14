@@ -22,9 +22,10 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
 
-from netdiag import __version__, adapters as ad, config, diagnose, monitor, probes, report
+from netdiag import __version__, adapters as ad, config, diagnose, live, monitor, probes, report
 from netdiag.sysutil import attach_console, reports_folder, resource_path
 
 ICON_NAME = "ip-icon.ico"
@@ -194,6 +195,7 @@ def run_gui(include_down, want_external, cfg_path=None):
     reload_btn = head_button("↻", 13)
     check_btn = head_button("ПРОВЕРКА")
     monitor_btn = head_button("МОНИТОРИНГ")
+    info_btn = head_button("ИНФО")
 
     # --- прокручиваемая область ----------------------------------------
     canvas = tk.Canvas(left, bg=BG, highlightthickness=0, bd=0)
@@ -425,6 +427,7 @@ def run_gui(include_down, want_external, cfg_path=None):
         b.bind("<Button-1>", lambda _e: show_tab(name))
         tab_labels[name] = b
 
+    tab_button("info", "ИНФОРМАЦИЯ")
     tab_button("check", "ПРОВЕРКА")
     tab_button("monitor", "МОНИТОРИНГ")
     hide = tk.Label(tabs, text="скрыть  ›", font=f_meta, fg=FG_MUTED, bg=BG, cursor="hand2")
@@ -578,6 +581,58 @@ def run_gui(include_down, want_external, cfg_path=None):
     m_link("стоп", stop_monitor)
     m_link("старт", start_monitor)
 
+    # --- информация в реальном времени -----------------------------------
+    info_page = tk.Frame(body_side, bg=BG)
+    pages["info"] = info_page
+    i_status = tk.Label(info_page, text="обновляется каждые 2 с", font=f_head, fg=FG_MUTED,
+                        bg=BG, anchor="w")
+    i_status.pack(fill="x", padx=16, pady=(10, 6))
+    i_grid = tk.Frame(info_page, bg=BG)
+    i_grid.pack(fill="both", expand=True, padx=16)
+    i_grid.columnconfigure(2, weight=1)
+    i_rows = []  # [(точка, название, значение)]
+    info = live.Info(cfg)
+    info_state = {"busy": False}
+
+    def show_info(res):
+        info_state["busy"] = False
+        if isinstance(res, Exception):
+            i_status.config(text="ошибка: %s" % res, fg=FG_FAIL)
+            return
+        rows, key = res
+        i_status.config(text="обновляется каждые 2 с", fg=FG_MUTED)
+        while len(i_rows) < len(rows):
+            r = len(i_rows)
+            dot = tk.Label(i_grid, text="●", font=(family, 8), bg=BG)
+            name = tk.Label(i_grid, font=f_head, fg=FG_MUTED, bg=BG, anchor="nw")
+            val = tk.Label(i_grid, font=(family, 10), fg=FG, bg=BG, anchor="w", justify="left",
+                           wraplength=PANEL_W - 210)
+            dot.grid(row=r, column=0, sticky="nw", pady=5, padx=(0, 6))
+            name.grid(row=r, column=1, sticky="nw", pady=5, padx=(0, 12))
+            val.grid(row=r, column=2, sticky="nw", pady=4)
+            i_rows.append((dot, name, val))
+        for i, (dot, name, val) in enumerate(i_rows):
+            if i < len(rows):
+                title, value, st = rows[i]
+                dot.config(fg=STATUS_COLOR.get(st, FG_MUTED))
+                name.config(text=title)
+                val.config(text=value)
+                for w in (dot, name, val):
+                    w.grid()
+            else:
+                for w in (dot, name, val):
+                    w.grid_remove()
+        if info.want_external(key, time.time()):
+            info.ext_busy = True
+            threading.Thread(target=info.refresh_external, args=(key,), daemon=True).start()
+
+    def info_tick():
+        visible = panel["open"] and panel["tab"] == "info"
+        if visible and not info_state["busy"]:
+            info_state["busy"] = True
+            in_background(info.read, show_info)
+        root.after(2000, info_tick)
+
     # --- одна кнопка: проверка + отчёт ----------------------------------
     rep_state = {"busy": False}
 
@@ -623,6 +678,12 @@ def run_gui(include_down, want_external, cfg_path=None):
         if not run_state["data"] and not run_state["busy"]:
             start_check()
 
+    def open_info(_e=None):
+        open_panel("info")
+        if not info_state["busy"]:
+            info_state["busy"] = True
+            in_background(info.read, show_info)
+
     def open_monitor(_e=None):
         open_panel("monitor")
         if not mon_running():
@@ -638,6 +699,7 @@ def run_gui(include_down, want_external, cfg_path=None):
     reload_btn.bind("<Button-1>", refresh)
     check_btn.bind("<Button-1>", open_check)
     monitor_btn.bind("<Button-1>", open_monitor)
+    info_btn.bind("<Button-1>", open_info)
     root.bind("<F5>", refresh)
     root.bind("<Escape>", lambda _e: close_panel() if panel["open"] else on_close())
     root.protocol("WM_DELETE_WINDOW", on_close)
@@ -645,6 +707,7 @@ def run_gui(include_down, want_external, cfg_path=None):
         root.after(500, start_monitor)
 
     pump()
+    info_tick()
     refresh()
     root.mainloop()
 

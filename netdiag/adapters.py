@@ -489,3 +489,33 @@ def tcp_connections(syn_sent=False):
             "pid": pid, "process": name, "path": path, "state": TCP_STATES[state],
         })
     return res
+
+
+def udp_pids():
+    """Процессы, у которых открыты UDP-сокеты (IPv4 и IPv6): {pid}. None вне Windows."""
+    if not IS_WINDOWS:
+        return None
+    import struct
+    func = ctypes.windll.iphlpapi.GetExtendedUdpTable
+    pids = set()
+    # AF_INET=2: строка 12 байт, AF_INET6=23: 28 байт; UDP_TABLE_OWNER_PID=1
+    for family, row in ((2, 12), (23, 28)):
+        size = ctypes.c_ulong(0)
+        buf = None
+        for _ in range(5):
+            buf = ctypes.create_string_buffer(size.value or 1)
+            rc = func(buf, ctypes.byref(size), False, family, 1, 0)
+            if rc == 0:
+                break
+            if rc != 122:
+                buf = None
+                break
+        else:
+            buf = None
+        if buf is None:
+            continue
+        raw = buf.raw
+        count = struct.unpack_from("<I", raw, 0)[0]
+        for i in range(count):
+            pids.add(struct.unpack_from("<I", raw, 4 + i * row + row - 4)[0])
+    return pids
