@@ -354,9 +354,11 @@ def rdp_client_events(minutes=60):
 # --------------------------------------------------------------------------
 _PS_LINKS = r"""
 $r = @{}
-$r.tcp = @(Get-NetTCPConnection -State Established | ForEach-Object {
+$r.tcp = @(Get-NetTCPConnection -State Established,SynSent -ErrorAction SilentlyContinue |
+  ForEach-Object {
   @{ remote = [string]$_.RemoteAddress; rport = [int]$_.RemotePort;
-     local = [string]$_.LocalAddress; procid = [int]$_.OwningProcess } })
+     local = [string]$_.LocalAddress; procid = [int]$_.OwningProcess;
+     state = [string]$_.State; created = $_.CreationTime.ToString('o') } })
 $r.procs = @{}
 foreach ($i in ($r.tcp | ForEach-Object { $_.procid } | Sort-Object -Unique)) {
   $p = Get-Process -Id $i -ErrorAction SilentlyContinue
@@ -423,7 +425,7 @@ def server_links(links, ips, port=None):
         return res
     ipset = set(ips)
     for c in links.get("tcp", []):
-        if _proc_matches(c, PROXY_PROCS):
+        if _proc_matches(c, PROXY_PROCS) or c.get("state", "Established") != "Established":
             continue  # через прокси другого VPN идут и наши собственные проверки
         if c.get("remote") in ipset and (port is None or c.get("rport") == port):
             res["tcp"].append(c)

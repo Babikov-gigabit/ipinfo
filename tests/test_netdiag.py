@@ -311,6 +311,21 @@ class DiagnoseTest(unittest.TestCase):
         self.assertEqual(st, diagnose.WARN)
         self.assertIn("нет в ответе DNS", text)
 
+    def test_vpn_connection_first_connected(self):
+        srv = {"name": "ztn", "host": "vpng.example.ru", "port": 443, "proto": "tcp"}
+        p = r"C:\Program Files\Security Code\Continent ZTN\ztn.exe"
+        links = {"tcp": [
+            {"remote": "203.0.113.2", "rport": 443, "process": "ztn", "path": p,
+             "state": "Established", "created": "2026-10-14T10:05:00.0000000+03:00"},
+            {"remote": "203.0.113.1", "rport": 443, "process": "ztn", "path": p,
+             "state": "Established", "created": "2026-10-14T10:00:00.0000000+03:00"}],
+            "routes": []}
+        st, text, used, _ = diagnose.vpn_connection(links, ["203.0.113.1", "203.0.113.2"],
+                                                    srv, self.cfg)
+        self.assertEqual(used[0], "203.0.113.1")
+        self.assertIn("(с 10:00:00)", text)
+        self.assertIn("первым подключился 203.0.113.1", text)
+
     def test_vpn_connection_from_host_route(self):
         srv = {"name": "ztn", "host": "vpng.example.ru", "port": 443, "proto": "tcp"}
         links = {"tcp": [], "routes": [{"prefix": "8.8.4.4/32", "nexthop": "192.168.1.1"},
@@ -481,6 +496,22 @@ class MonitorTest(unittest.TestCase):
     def test_tcp_connections_windows(self):
         conns = monitor.ad.tcp_connections()
         self.assertIsInstance(conns, list)
+
+    def test_vpn_client_tries_first_ip_then_second(self):
+        self.m.cfg["vpn"] = [{"name": "К", "host": "vpn.example", "port": 443, "proto": "tcp"}]
+        path = r"C:\Program Files\Security Code\Continent ZTN\ztn.exe"
+
+        def c(ip, lport, state):
+            return {"remote": ip, "rport": 443, "lport": lport, "pid": 5, "process": "ztn",
+                    "path": path, "state": state}
+        self.m._check_vpn_tcp([], 100)
+        self.m._check_vpn_tcp([c("203.0.113.1", 50001, "syn_sent")], 102)
+        self.m._check_vpn_tcp([c("203.0.113.2", 50002, "syn_sent")], 125)
+        self.m._check_vpn_tcp([c("203.0.113.2", 50002, "established")], 127)
+        texts = [e["text"] for e in self.events]
+        self.assertIn("пробует подключиться к 203.0.113.1:443", texts[0])
+        self.assertIn("203.0.113.1:443 не ответил", " ".join(texts))
+        self.assertIn("подключился к 203.0.113.2:443 (ответ через 2 с)", texts[-1])
 
     def test_rdp_event_props_name_value(self):
         e = winsys.parse_rdp_event({"id": 1026, "props": ["Disconnect Reason", "2308"]})

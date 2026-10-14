@@ -77,14 +77,28 @@ def vpn_connection(links, ips, srv, cfg):
     own = winsys.client_links(links, patterns)["client"]
     port = srv["port"] if srv["proto"] == "tcp" else None
     if own:
+        est = sorted((c for c in own if c.get("state", "Established") == "Established"),
+                     key=lambda c: c.get("created") or "")
+        syn = [c for c in own if c.get("state") == "SynSent"]
         eps, used = [], []
-        for c in own:
+        for c in est:
             ep = "%s:%s" % (c["remote"], c["rport"])
+            if c.get("created"):
+                ep += " (с %s)" % c["created"][11:19]
             if ep not in eps:
                 eps.append(ep)
             if c["remote"] not in used:
                 used.append(c["remote"])
-        text = "клиент (процесс %s) подключён к %s" % (own[0].get("process") or "?", ", ".join(eps))
+        proc = own[0].get("process") or "?"
+        tries = sorted({"%s:%s" % (c["remote"], c["rport"]) for c in syn})
+        if not est:
+            return WARN, "клиент (процесс %s) пытается подключиться к %s, ответа нет" % (
+                proc, ", ".join(tries)), [], {"client_tcp": own}
+        text = "клиент (процесс %s) подключён к %s" % (proc, ", ".join(eps))
+        if len(used) > 1:
+            text += "; первым подключился %s" % used[0]
+        if tries:
+            text += "; без ответа: %s" % ", ".join(tries)
         foreign = [ip for ip in used if ip not in ips]
         if foreign and not set(used) & set(ips):
             text += "; этих адресов нет в ответе DNS для %s: DNS сейчас отдаёт другие " \

@@ -84,6 +84,7 @@ class Monitor:
         self.state = {}
         self.vpn = {}          # имя сервера -> {"ips": [...], "used": [...]}
         self._vpn_fut = None
+        self.vpn_conns = None  # соединения и попытки подключения VPN-клиента
         self.rdp_conns = None  # открытые TCP-соединения клиента RDP: ключ -> dict
         self.rdp_closed = []   # недавно закрытые соединения клиента RDP
         self.rdp_session = None  # {"server", "t"} - последнее подключение по журналу
@@ -192,7 +193,7 @@ class Monitor:
         stats = self._tunnel_stats(snap)
         if self.cfg.get("vpn"):
             self._apply_vpn(self._read_vpn())
-        self._check_rdp_tcp(time.time())
+        self._check_tcp(time.time())
         last_wifi = last_rdp_log = last_rdp_tcp = last_vpn = time.time()
         rdp_seen = set(self._rdp_event_key(e) for e in (winsys.rdp_client_events(10) or []))
         last_tick = time.time()
@@ -254,7 +255,7 @@ class Monitor:
                 self._vpn_fut = self.pool.submit(self._read_vpn)
             tick["vpn"] = {n: list(v.get("used") or []) for n, v in self.vpn.items()}
 
-            tick["rdp_tcp"] = self._check_rdp_tcp(now)
+            tick["rdp_tcp"] = self._check_tcp(now)
 
             self.history.append(tick)
             while self.history and now - self.history[0]["t"] > HISTORY_SEC:
@@ -442,16 +443,66 @@ class Monitor:
         return any(c.get("remote") == t.get("ip") and c.get("rport") == t.get("port")
                    for t in self.rdp_targets)
 
-    def _check_rdp_tcp(self, now):
+    def _check_tcp(self, now):
+        """Один снимок TCP-таблицы на цикл: соединения клиента RDP и VPN-клиента."""
+        conns = ad.tcp_connections(syn_sent=True)
+        if conns is None:
+            return None
+        self._check_vpn_tcp(conns, now)
+        return self._check_rdp_tcp(now, conns)
+
+    def _check_vpn_tcp(self, conns, now):
+        """Попытки подключения и соединения самого VPN-клиента: видно, какой адрес
+        сервера он пробовал первым, какой не ответил и к какому подключился."""
+        patterns = [w for ws in self.cfg["patterns"].values() for w in ws]
+        ports = {v["port"] for v in self.cfg.get("vpn", []) if v.get("proto") == "tcp"}
+        cur = {}
+        for c in winsys.client_links({"tcp": conns}, patterns)["client"]:
+            if not ports or c["rport"] in ports:
+                cur[(c["remote"], c["rport"], c["lport"])] = c
+        first = self.vpn_conns is None
+        old = self.vpn_conns or {}
+        for k, c in cur.items():
+            prev = old.get(k)
+            c["since"] = prev.get("since") if prev else (None if first else now)
+            who = "VPN-клиент (%s)" % (c.get("process") or "pid %s" % c.get("pid"))
+            ep = "%s:%d" % (c["remote"], c["rport"])
+            if c["state"] == "syn_sent" and not prev:
+                self.emit("info", "%s пробует подключиться к %s" % (who, ep), vpn_tcp=c)
+            elif c["state"] == "established" and (not prev or prev["state"] != "established"):
+                if first:
+                    self.emit("info", "%s уже подключён к %s" % (who, ep), vpn_tcp=c)
+                else:
+                    waited = (" (ответ через %s)" % _minutes(now - prev["since"])
+                              if prev and prev.get("since") else "")
+                    c["since"] = now
+                    self.emit("ok", "%s подключился к %s%s" % (who, ep, waited), vpn_tcp=c)
+        for k, c in old.items():
+            if k in cur:
+                continue
+            who = "VPN-клиент (%s)" % (c.get("process") or "pid %s" % c.get("pid"))
+            ep = "%s:%d" % (c["remote"], c["rport"])
+            if c["state"] == "syn_sent":
+                self.emit("warn", "%s: %s не ответил, попытка прекращена" % (who, ep),
+                          vpn_tcp=c)
+            else:
+                lived = (" (было открыто %s)" % _minutes(now - c["since"])
+                         if c.get("since") else "")
+                self.emit("warn", "%s: соединение с %s закрыто%s" % (who, ep, lived),
+                          vpn_tcp=c)
+        self.vpn_conns = cur
+
+    def _check_rdp_tcp(self, now, conns=None):
         """Сравнивает открытые TCP-соединения клиента RDP с прошлым циклом.
 
         Возвращает число открытых соединений (None, если прочитать не удалось)."""
-        conns = ad.tcp_connections()
+        if conns is None:
+            conns = ad.tcp_connections()
         if conns is None:
             return None
         cur = {}
         for c in conns:
-            if self._is_rdp_conn(c):
+            if c.get("state", "established") == "established" and self._is_rdp_conn(c):
                 cur[(c["remote"], c["rport"], c["lport"])] = c
         first = self.rdp_conns is None
         old = self.rdp_conns or {}

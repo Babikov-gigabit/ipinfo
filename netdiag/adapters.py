@@ -425,9 +425,10 @@ _proc_names = {}
 
 
 def _process_name(pid):
+    """(имя без .exe, полный путь) процесса."""
     if pid in _proc_names:
         return _proc_names[pid]
-    name = ""
+    name = path = ""
     k32 = ctypes.windll.kernel32
     h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if h:
@@ -435,19 +436,24 @@ def _process_name(pid):
             buf = ctypes.create_unicode_buffer(1024)
             size = ctypes.c_ulong(len(buf))
             if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-                name = re.split(r"[\\/]", buf.value)[-1]
+                path = buf.value
+                name = re.split(r"[\\/]", path)[-1]
                 if name.lower().endswith(".exe"):
                     name = name[:-4]
         finally:
             k32.CloseHandle(h)
     if len(_proc_names) > 2000:
         _proc_names.clear()
-    _proc_names[pid] = name
-    return name
+    _proc_names[pid] = (name, path)
+    return name, path
 
 
-def tcp_connections():
-    """Установленные TCP-соединения IPv4: [{remote, rport, local, lport, pid, process}].
+TCP_STATES = {2: "syn_sent", 5: "established"}
+
+
+def tcp_connections(syn_sent=False):
+    """Установленные TCP-соединения IPv4: [{remote, rport, local, lport, pid, process, path,
+    state}]. С syn_sent=True - ещё и попытки подключения, на которые пока нет ответа.
 
     None, если прочитать не удалось (или не Windows).
     """
@@ -472,13 +478,14 @@ def tcp_connections():
     res = []
     for i in range(count):
         state, laddr, lport, raddr, rport, pid = struct.unpack_from("<6I", raw, 4 + i * 24)
-        if state != 5:  # MIB_TCP_STATE_ESTAB
+        if state != 5 and not (syn_sent and state == 2):  # ESTAB / SYN_SENT
             continue
+        name, path = _process_name(pid)
         res.append({
             "remote": socket.inet_ntoa(struct.pack("<I", raddr)),
             "rport": socket.ntohs(rport & 0xFFFF),
             "local": socket.inet_ntoa(struct.pack("<I", laddr)),
             "lport": socket.ntohs(lport & 0xFFFF),
-            "pid": pid, "process": _process_name(pid),
+            "pid": pid, "process": name, "path": path, "state": TCP_STATES[state],
         })
     return res
