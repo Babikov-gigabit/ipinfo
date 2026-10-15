@@ -9,6 +9,7 @@ import logging.handlers
 import os
 import platform
 import socket
+import time
 import zipfile
 
 from . import __version__
@@ -48,6 +49,76 @@ def setup_logging():
         log.addHandler(h)
     except OSError:
         log.addHandler(logging.NullHandler())
+
+
+# Что программа сама создаёт и может удалять по сроку хранения. Остальные
+# файлы в папках (в том числе положенные туда пользователем) не трогаются.
+OLD_FILE_PATTERNS = {
+    "logs": ("monitor-*.log", "monitor-*.jsonl"),
+    "reports": ("ipinfo-*.zip",),
+    "folder": ("Мониторинг *.txt", "Отчёт *.zip", "Отчёт *.html"),
+}
+
+
+def cleanup_old(keep_days, folder=None, now=None):
+    """Удаляет журналы мониторинга, отчёты и записи истории проверок старше
+    keep_days дней. keep_days = 0 - ничего не удалять. Возвращает число
+    удалённых файлов и строк истории."""
+    if not keep_days:
+        return 0
+    now = now or time.time()
+    cutoff = now - keep_days * 86400
+    removed = 0
+    dirs = {"logs": logs_dir(), "reports": reports_dir(), "folder": folder}
+    for kind, patterns in OLD_FILE_PATTERNS.items():
+        d = dirs.get(kind)
+        if not d or not os.path.isdir(d):
+            continue
+        for pat in patterns:
+            for path in glob.glob(os.path.join(d, pat)):
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                        removed += 1
+                except OSError as e:
+                    log.warning("не удалось удалить старый файл %s: %s", path, e)
+    removed += _trim_checks(cutoff)
+    if removed:
+        log.info("удалено старых журналов и отчётов (старше %d дн.): %d", keep_days, removed)
+    return removed
+
+
+def _trim_checks(cutoff):
+    """Оставляет в checks.jsonl только проверки не старше cutoff."""
+    path = os.path.join(logs_dir(), "checks.jsonl")
+    try:
+        if os.path.getmtime(path) < cutoff:
+            os.remove(path)
+            return 1
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return 0
+    limit = datetime.datetime.fromtimestamp(cutoff).isoformat(timespec="seconds")
+    keep = []
+    for line in lines:
+        try:
+            t = json.loads(line).get("time") or ""
+        except ValueError:
+            continue
+        if t >= limit:
+            keep.append(line)
+    if len(keep) == len(lines):
+        return 0
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(keep)
+        os.replace(tmp, path)
+    except OSError as e:
+        log.warning("не удалось сократить checks.jsonl: %s", e)
+        return 0
+    return len(lines) - len(keep)
 
 
 def save_check(data):

@@ -54,6 +54,9 @@ incoming = no
 folder =
 ; Запускать мониторинг сразу при открытии программы (yes/no).
 autostart = yes
+; Сколько дней хранить журналы мониторинга, историю проверок и отчёты.
+; Более старые удаляются при запуске программы. 0 - не удалять никогда.
+keep_days = 30
 
 [logs]
 ; Папки или файлы с журналами VPN-клиентов, которые добавятся в отчёт.
@@ -72,6 +75,13 @@ def config_path():
     if os.path.exists(fallback):
         return fallback
     return near
+
+
+def _int(value, default):
+    try:
+        return max(0, int(str(value).strip()))
+    except ValueError:
+        return default
 
 
 def _split(value):
@@ -152,4 +162,5 @@ def load(path=None):
         "logs": {n: os.path.expandvars(v.strip()) for n, v in cp.items("logs") if v.strip()},
         "report_folder": os.path.expandvars(cp.get("report", "folder", fallback="").strip()),
         "autostart": cp.getboolean("report", "autostart", fallback=True),
+        "keep_days": _int(cp.get("report", "keep_days", fallback="30"), 30),
     }

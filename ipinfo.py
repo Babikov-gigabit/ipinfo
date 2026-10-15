@@ -133,6 +133,12 @@ def run_gui(include_down, want_external, cfg_path=None):
     cfg_file = cfg_path or config.ensure_config()
     cfg = config.load(cfg_file)
     folder = reports_folder(cfg.get("report_folder"))
+
+    def cleanup():
+        """Старые журналы и отчёты - при запуске и раз в 6 часов, пока окно открыто."""
+        threading.Thread(target=report.cleanup_old, args=(cfg.get("keep_days", 30), folder),
+                         daemon=True).start()
+        root.after(6 * 3600 * 1000, cleanup)
     try:
         root.iconbitmap(resource_path(ICON_NAME))
     except Exception:
@@ -775,6 +781,7 @@ def run_gui(include_down, want_external, cfg_path=None):
         root.after(500, start_monitor)
 
     pump()
+    cleanup()
     info_tick()
     refresh()
     root.mainloop()
@@ -822,6 +829,7 @@ def main():
 
     if args.monitor:
         cfg = config.load(args.config or config.ensure_config())
+        report.cleanup_old(cfg.get("keep_days", 30), reports_folder(cfg.get("report_folder")))
         m = monitor.Monitor(cfg, interval=args.interval,
                             on_event=lambda ev, line: print(line, flush=True))
         print("Журнал: %s\nОстановить: Ctrl+C\n" % m.text_path, flush=True)
@@ -836,6 +844,7 @@ def main():
 
     if args.check or args.report:
         cfg = config.load(args.config or config.ensure_config())
+        report.cleanup_old(cfg.get("keep_days", 30), reports_folder(cfg.get("report_folder")))
         console_check(args, cfg)
         return
 
