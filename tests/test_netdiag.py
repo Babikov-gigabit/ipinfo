@@ -500,6 +500,50 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn("мониторинг 5 мин", page)
 
 
+class CleanupTest(unittest.TestCase):
+    def test_old_logs_and_reports_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs, reps, folder = (os.path.join(tmp, n) for n in ("logs", "reports", "folder"))
+            for d in (logs, reps, folder):
+                os.makedirs(d)
+            now = 1760000000
+            old, new = now - 40 * 86400, now - 5 * 86400
+
+            def put(d, name, mtime):
+                path = os.path.join(d, name)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("x")
+                os.utime(path, (mtime, mtime))
+                return path
+            gone = [put(logs, "monitor-20260101-000000.log", old),
+                    put(reps, "ipinfo-pc-20260101.zip", old),
+                    put(folder, "Мониторинг 2026-01-01 10-00.txt", old),
+                    put(folder, "Отчёт pc 2026-01-01.zip", old)]
+            kept = [put(logs, "monitor-20261010-000000.log", new),
+                    put(folder, "Последняя проверка.html", old),
+                    put(folder, "мой файл.txt", old)]
+            iso = lambda t: datetime.datetime.fromtimestamp(t).isoformat(timespec="seconds")
+            with open(os.path.join(logs, "checks.jsonl"), "w", encoding="utf-8") as f:
+                f.write(json.dumps({"time": iso(old)}) + "\n" + json.dumps({"time": iso(new)}) + "\n")
+            with mock.patch.object(report, "logs_dir", return_value=logs), \
+                    mock.patch.object(report, "reports_dir", return_value=reps):
+                self.assertEqual(report.cleanup_old(0, folder, now=now), 0)
+                self.assertEqual(report.cleanup_old(30, folder, now=now), 5)
+            self.assertFalse(any(os.path.exists(p) for p in gone))
+            self.assertTrue(all(os.path.exists(p) for p in kept))
+            with open(os.path.join(logs, "checks.jsonl"), encoding="utf-8") as f:
+                self.assertEqual(len(f.readlines()), 1)
+
+    def test_keep_days_setting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ipinfo.ini")
+            for text, want in (("[report]\nkeep_days = 7\n", 7), ("[report]\nkeep_days = 0\n", 0),
+                               ("[report]\nkeep_days = много\n", 30), ("", 30)):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                self.assertEqual(config.load(path)["keep_days"], want)
+
+
 class FixesTest(unittest.TestCase):
     def test_reg_args(self):
         self.assertEqual(fixes.reg_args(True), [
